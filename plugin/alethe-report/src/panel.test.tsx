@@ -4,7 +4,7 @@
 import { assert, describe, hostError, mockHost, mount, test } from 'orca/testing'
 import * as panel from './panel'
 
-const INSTRUCTION = /Rode `\/alethe report html` no terminal do projeto/
+const INSTRUCTION = /Sem relatórios ainda — escreva a tarefa acima e clique em 🚀 Orquestrar tarefa/
 
 describe('load (lógica do painel)', () => {
   test('empty list → estado vazio com a instrução da spec', async () => {
@@ -157,10 +157,10 @@ describe('runSetup (lógica do botão)', () => {
     const result = await panel.runSetup(async () => ({
       status: 'no-runs' as const,
       installed: false,
-      detail: 'Inicie uma tarefa com /alethe'
+      detail: 'Nenhuma tarefa orquestrada ainda — escreva uma tarefa no campo'
     }))
     assert.equal(result.status, 'no-runs')
-    assert.equal(result.detail, 'Inicie uma tarefa com /alethe')
+    assert.equal(result.detail, 'Nenhuma tarefa orquestrada ainda — escreva uma tarefa no campo')
   })
 })
 
@@ -251,7 +251,7 @@ describe('botão preparar-e-gerar', () => {
     await view.unmount()
   })
 
-  test('no-runs → nota informativa com o passo a passo do /alethe', async () => {
+  test('no-runs → nota informativa com o passo a passo do novo fluxo', async () => {
     const host = mockHost({
       requests: {
         'list-reports': () => ({ reports: [] }),
@@ -259,13 +259,18 @@ describe('botão preparar-e-gerar', () => {
           status: 'no-runs' as const,
           installed: true,
           detail:
-            'Alethe instalado ✓ — nenhuma tarefa orquestrada ainda. Inicie uma tarefa com /alethe no terminal do projeto e o relatório aparecerá aqui.'
+            'Alethe instalado ✓ — Nenhuma tarefa orquestrada ainda — escreva uma tarefa no campo e clique em 🚀 Orquestrar tarefa. (O comando /alethe roda dentro da conversa de um agente, não no shell.)'
         })
       }
     })
     const view = await mount(panel, { host })
     await view.press({ text: SETUP_BUTTON })
-    assert.ok(view.find({ text: /Inicie uma tarefa com \/alethe/ }), 'instrução do /alethe visível')
+    assert.ok(
+      view.find({ text: /escreva uma tarefa no campo/ }),
+      'instrução do novo fluxo visível'
+    )
+    assert.ok(view.find({ text: /conversa de um agente, não no shell/ }), 'não sugere shell')
+    assert.equal(view.find({ text: /no terminal do projeto/ }), null, 'cópia antiga some')
     assert.ok(view.find({ text: /Nenhum relatório/ }), 'estado vazio segue desenhado')
     assert.deepEqual(view.errors, [])
     await view.unmount()
@@ -292,7 +297,12 @@ describe('botão preparar-e-gerar', () => {
 
 // --- Campo "Qual tarefa?" + botão de orquestrar: o primeiro passo sem atrito. ---
 
-const START_BUTTON = /Orquestrar tarefa/
+/**
+ * O botão de orquestrar, como QUERY e não só como texto: a instrução do estado vazio agora
+ * também cita o 🚀, e `find` devolve o match mais interno — sem o `role` o teste poderia
+ * "achar" a frase da instrução no lugar do botão.
+ */
+const START_BUTTON = { role: 'button', text: /Orquestrar tarefa/ }
 const TASK_LABEL = 'Qual tarefa?'
 
 describe('runStart (lógica do botão de orquestrar)', () => {
@@ -328,17 +338,17 @@ describe('campo de tarefa no estado vazio', () => {
     })
     const view = await mount(panel, { host })
     assert.ok(view.find({ label: TASK_LABEL }), 'campo visível no estado vazio')
-    const button = view.find({ text: START_BUTTON })
+    const button = view.find(START_BUTTON)
     assert.ok(button, 'botão de orquestrar visível')
     assert.equal(button.disabled, true, 'sem texto não dispara')
     try {
-      await view.press({ text: START_BUTTON })
+      await view.press(START_BUTTON)
     } catch {
       /* Orca recusa a pressão em botão desabilitado — os dois casos têm que manter o worker intacto */
     }
     assert.deepEqual(starts, [], 'botão desabilitado nunca chama o worker')
     await view.type({ label: TASK_LABEL }, 'escrever o plano de testes')
-    const enabled = view.find({ text: START_BUTTON })
+    const enabled = view.find(START_BUTTON)
     assert.ok(enabled, 'botão continua visível')
     assert.equal(enabled.disabled, false, 'com texto habilita')
     assert.deepEqual(view.errors, [])
@@ -362,7 +372,7 @@ describe('campo de tarefa no estado vazio', () => {
     })
     const view = await mount(panel, { host })
     await view.type({ label: TASK_LABEL }, 'refatorar o setup')
-    await view.press({ text: START_BUTTON })
+    await view.press(START_BUTTON)
     assert.deepEqual(sent, ['refatorar o setup'], 'a tarefa digitada chega ao worker')
     assert.ok(view.find({ text: /Agente iniciado ✓/ }), 'nota de sucesso visível')
     assert.equal(view.valueOf({ label: TASK_LABEL }), '', 'campo limpo após iniciar')
@@ -379,7 +389,7 @@ describe('campo de tarefa no estado vazio', () => {
     })
     const view = await mount(panel, { host })
     await view.type({ label: TASK_LABEL }, 'refatorar o setup')
-    await view.press({ text: START_BUTTON })
+    await view.press(START_BUTTON)
     const note = view.find({ text: /nenhum workspace focado/ })
     assert.ok(note, 'nota de falha visível')
     assert.equal(note.props.tone, 'danger', 'tom destrutivo')
@@ -399,7 +409,7 @@ describe('campo de tarefa no estado vazio', () => {
     })
     const view = await mount(panel, { host })
     await view.type({ label: TASK_LABEL }, 'qualquer coisa')
-    await view.press({ text: START_BUTTON })
+    await view.press(START_BUTTON)
     assert.ok(view.find({ text: /worker off/ }), 'falha da request vira nota, não exceção')
     assert.deepEqual(view.errors, [], 'nunca exceção no frame')
     await view.unmount()
@@ -420,9 +430,9 @@ describe('campo de tarefa no estado vazio', () => {
     })
     const view = await mount(panel, { host })
     await view.type({ label: TASK_LABEL }, 'uma tarefa')
-    await view.press({ text: START_BUTTON })
+    await view.press(START_BUTTON)
     assert.ok(view.find({ text: /worker off/ }), 'primeira resposta: falha')
-    await view.press({ text: START_BUTTON })
+    await view.press(START_BUTTON)
     assert.equal(view.find({ text: /worker off/ }), null, 'nota antiga resetada no novo clique')
     assert.ok(view.find({ text: /Agente iniciado ✓/ }), 'nota nova no lugar')
     assert.deepEqual(view.errors, [])

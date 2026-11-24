@@ -823,6 +823,7 @@ describe('start-task handler', () => {
     assert.equal(res.detail, 'Escreva a tarefa antes de orquestrar.')
     assert.deepEqual(tw.host.callsOf('terminal.create'), [], 'sem terminal.create')
     assert.deepEqual(tw.host.callsOf('workspace.readContext'), [], 'validação antes de tudo')
+    assert.deepEqual(tw.host.calls, [], 'nenhuma chamada ao host antes de validar')
     await tw.deactivate()
   })
 

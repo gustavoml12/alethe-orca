@@ -15,8 +15,8 @@ import {
 } from 'orca'
 import type { ReportList, SetupResult, StartResult } from './reports'
 
-/** What the empty and error states show, worded exactly as the spec words it. */
-const INSTRUCTION = 'Rode `/alethe report html` no terminal do projeto'
+/** What the empty and error states show: the new flow's first step, never a shell command. */
+const INSTRUCTION = 'Sem relatórios ainda — escreva a tarefa acima e clique em 🚀 Orquestrar tarefa.'
 
 /** The panel's states: what one `list-reports` answer (or its failure) becomes. */
 export type PanelState =
@@ -217,7 +217,7 @@ export default function Panel() {
     <Row gap="sm" align="end">
       <Input
         label="Qual tarefa?"
-        placeholder="Qual tarefa?"
+        placeholder="ex.: mover os endpoints de billing para v2"
         value={task}
         disabled={starting}
         onChange={(value) => set(taskText, value)}

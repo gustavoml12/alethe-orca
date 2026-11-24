@@ -286,9 +286,12 @@ export function parseSetupWrite(output: string): boolean {
   return lastMarker(output, ['WROTE_OK', 'WROTE_FAIL']) === 'WROTE_OK'
 }
 
-/** What the panel shows when there is nothing to report yet, installed or not. */
-const NO_TASKS = 'Inicie uma tarefa com /alethe no terminal do projeto e o relatório aparecerá aqui.'
-const INSTALLED_NO_TASKS = `Alethe instalado ✓ — nenhuma tarefa orquestrada ainda. ${NO_TASKS}`
+/** What the panel shows when there is nothing to report yet — the NEW flow's first step, never
+ *  a shell hint: base sentence for a machine without the skill yet… */
+const NO_TASKS =
+  'Nenhuma tarefa orquestrada ainda — escreva uma tarefa no campo e clique em 🚀 Orquestrar tarefa. (O comando /alethe roda dentro da conversa de um agente, não no shell.)'
+/** …and the same sentence after this very call installed the skill (prefix stays verbatim). */
+const INSTALLED_NO_TASKS = `Alethe instalado ✓ — ${NO_TASKS}`
 const INSTALL_FAILED_DETAIL =
   'Falha ao instalar o alethe (git clone). Confira sua autenticação GitHub (gh auth login) e tente de novo.'
 /** The check itself could not be read — a different failure from a clone that refused. */
