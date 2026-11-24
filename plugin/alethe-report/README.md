@@ -7,6 +7,12 @@ orca plugin dev request . list-reports
 orca plugin dev request . open-report --data '{"path":"/home/you/.config/alethe/orchestrations/2026-11-24-1/wave-2/report.html"}'
 ```
 
+## Decisão de abertura (Task 4, 2026-11-24)
+
+- Sonda: `orca tab create --url "file:///tmp/alethe-probe.html" --json` → **abriu e carregou**: `{"ok": true, "result": {"browserPageId": "8fc35093-5acd-48bc-b17a-8af632c9cdea"}}`; conferido com `orca tab show --page <id>` e `orca tab list` → `url: "file:///tmp/alethe-probe.html"`, `title: "alethe-probe.html"`, `loaded: true`, `loadError: null`. O mesmo comando, executado de um terminal efêmero no workspace exatamente como o worker o faz (sem `--worktree`), também carregou a página (`loaded: true`, `loadError: null`).
+- Comportamento: `browser-tab` (`via` no retorno de `open-report`)
+- Motivo: o browser embutido do Orca aceita o scheme `file://` e renderiza a página (`loaded: true`, `loadError: null`), então o caminho da spec — aba de browser — é o que o código já faz: nenhum fallback foi necessário, `openReport` segue **sem** `editor.open` e uma falha do terminal continua respondendo `via: "none"` com o `error` lido. Fora de um terminal do Orca o mesmo comando recusou com `selector_ambiguous` (`More than one Orca workspace matched the current directory. Choose an exact workspace.` — 6 folder workspaces duplicados no cwd `Projetos_ebnez`): é resolução de workspace, não recusa do scheme; dentro do terminal do Orca, onde o worker roda, o contexto resolve sozinho.
+
 ## Develop
 
 ```sh
