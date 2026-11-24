@@ -289,3 +289,143 @@ describe('botão preparar-e-gerar', () => {
     await view.unmount()
   })
 })
+
+// --- Campo "Qual tarefa?" + botão de orquestrar: o primeiro passo sem atrito. ---
+
+const START_BUTTON = /Orquestrar tarefa/
+const TASK_LABEL = 'Qual tarefa?'
+
+describe('runStart (lógica do botão de orquestrar)', () => {
+  test('request rejeitada vira failed como dado, nunca exceção', async () => {
+    const result = await panel.runStart(async () => {
+      throw new Error('worker off')
+    })
+    assert.equal(result.status, 'failed')
+    assert.match(result.detail, /worker off/)
+  })
+
+  test('resposta do worker passa adiante como está', async () => {
+    const result = await panel.runStart(async () => ({
+      status: 'started' as const,
+      detail: 'Agente iniciado ✓'
+    }))
+    assert.equal(result.status, 'started')
+    assert.equal(result.detail, 'Agente iniciado ✓')
+  })
+})
+
+describe('campo de tarefa no estado vazio', () => {
+  test('input "Qual tarefa?" + botão visíveis; desabilitado enquanto o campo estiver vazio', async () => {
+    const starts: string[] = []
+    const host = mockHost({
+      requests: {
+        'list-reports': () => ({ reports: [] }),
+        'start-task': ({ task }) => {
+          starts.push(task)
+          return { status: 'started' as const, detail: 'Agente iniciado ✓' }
+        }
+      }
+    })
+    const view = await mount(panel, { host })
+    assert.ok(view.find({ label: TASK_LABEL }), 'campo visível no estado vazio')
+    const button = view.find({ text: START_BUTTON })
+    assert.ok(button, 'botão de orquestrar visível')
+    assert.equal(button.disabled, true, 'sem texto não dispara')
+    try {
+      await view.press({ text: START_BUTTON })
+    } catch {
+      /* Orca recusa a pressão em botão desabilitado — os dois casos têm que manter o worker intacto */
+    }
+    assert.deepEqual(starts, [], 'botão desabilitado nunca chama o worker')
+    await view.type({ label: TASK_LABEL }, 'escrever o plano de testes')
+    const enabled = view.find({ text: START_BUTTON })
+    assert.ok(enabled, 'botão continua visível')
+    assert.equal(enabled.disabled, false, 'com texto habilita')
+    assert.deepEqual(view.errors, [])
+    await view.unmount()
+  })
+
+  test('started → nota de sucesso, campo limpo e nenhum erro no frame', async () => {
+    const sent: string[] = []
+    const host = mockHost({
+      requests: {
+        'list-reports': () => ({ reports: [] }),
+        'start-task': ({ task }) => {
+          sent.push(task)
+          return {
+            status: 'started' as const,
+            detail:
+              'Agente iniciado ✓ — acompanhe o terminal; o relatório aparecerá aqui quando as waves concluírem.'
+          }
+        }
+      }
+    })
+    const view = await mount(panel, { host })
+    await view.type({ label: TASK_LABEL }, 'refatorar o setup')
+    await view.press({ text: START_BUTTON })
+    assert.deepEqual(sent, ['refatorar o setup'], 'a tarefa digitada chega ao worker')
+    assert.ok(view.find({ text: /Agente iniciado ✓/ }), 'nota de sucesso visível')
+    assert.equal(view.valueOf({ label: TASK_LABEL }), '', 'campo limpo após iniciar')
+    assert.deepEqual(view.errors, [], 'nunca exceção no frame')
+    await view.unmount()
+  })
+
+  test('failed → nota destrutiva com o detalhe e o campo preservado', async () => {
+    const host = mockHost({
+      requests: {
+        'list-reports': () => ({ reports: [] }),
+        'start-task': () => ({ status: 'failed' as const, detail: 'nenhum workspace focado' })
+      }
+    })
+    const view = await mount(panel, { host })
+    await view.type({ label: TASK_LABEL }, 'refatorar o setup')
+    await view.press({ text: START_BUTTON })
+    const note = view.find({ text: /nenhum workspace focado/ })
+    assert.ok(note, 'nota de falha visível')
+    assert.equal(note.props.tone, 'danger', 'tom destrutivo')
+    assert.equal(view.valueOf({ label: TASK_LABEL }), 'refatorar o setup', 'campo preservado na falha')
+    assert.deepEqual(view.errors, [], 'nunca exceção no frame')
+    await view.unmount()
+  })
+
+  test('request rejeitada → nota destrutiva, sem exceção no frame', async () => {
+    const host = mockHost({
+      requests: {
+        'list-reports': () => ({ reports: [] }),
+        'start-task': () => {
+          throw hostError('unavailable', 'worker off')
+        }
+      }
+    })
+    const view = await mount(panel, { host })
+    await view.type({ label: TASK_LABEL }, 'qualquer coisa')
+    await view.press({ text: START_BUTTON })
+    assert.ok(view.find({ text: /worker off/ }), 'falha da request vira nota, não exceção')
+    assert.deepEqual(view.errors, [], 'nunca exceção no frame')
+    await view.unmount()
+  })
+
+  test('a nota do clique anterior some no clique seguinte (mesma disciplina do setup)', async () => {
+    let press = 0
+    const host = mockHost({
+      requests: {
+        'list-reports': () => ({ reports: [] }),
+        'start-task': () => {
+          press += 1
+          return press === 1
+            ? { status: 'failed' as const, detail: 'worker off' }
+            : { status: 'started' as const, detail: 'Agente iniciado ✓' }
+        }
+      }
+    })
+    const view = await mount(panel, { host })
+    await view.type({ label: TASK_LABEL }, 'uma tarefa')
+    await view.press({ text: START_BUTTON })
+    assert.ok(view.find({ text: /worker off/ }), 'primeira resposta: falha')
+    await view.press({ text: START_BUTTON })
+    assert.equal(view.find({ text: /worker off/ }), null, 'nota antiga resetada no novo clique')
+    assert.ok(view.find({ text: /Agente iniciado ✓/ }), 'nota nova no lugar')
+    assert.deepEqual(view.errors, [])
+    await view.unmount()
+  })
+})

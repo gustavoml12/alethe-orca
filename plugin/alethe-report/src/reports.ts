@@ -1,7 +1,9 @@
 // Discovery and opening of Alethe's report.html files. Pure helpers plus orchestration over an
 // injected host, so every path — including a failing one — is testable without a live Orca.
 // The manifest grants only workspace:read, terminal:send and terminal:read: every host call
-// below stays inside those three, and every terminal opened here is closed in a `finally`.
+// below stays inside those three, and every ephemeral terminal opened here is closed in a
+// `finally`. The one exception is `startTask`'s agent terminal: it is the live session the user
+// watches, so it is created and deliberately left open.
 
 /** What the workers' host calls look like: a method name and its params, unknown until answered. */
 export type Host = {
@@ -27,6 +29,12 @@ export type SetupResult = {
   detail: string
   /** Absolute report.html path, only when `status` is `generated`. */
   path?: string
+}
+
+/** `start-task`'s answer: the agent terminal was opened (or why it was not), as data. */
+export type StartResult = {
+  status: 'started' | 'failed'
+  detail: string
 }
 
 /** Where Alethe's orchestrations (and each wave's report.html) live. */
@@ -283,6 +291,8 @@ const NO_TASKS = 'Inicie uma tarefa com /alethe no terminal do projeto e o relat
 const INSTALLED_NO_TASKS = `Alethe instalado ✓ — nenhuma tarefa orquestrada ainda. ${NO_TASKS}`
 const INSTALL_FAILED_DETAIL =
   'Falha ao instalar o alethe (git clone). Confira sua autenticação GitHub (gh auth login) e tente de novo.'
+/** The check itself could not be read — a different failure from a clone that refused. */
+const CHECK_FAILED_DETAIL = 'Não foi possível verificar se o alethe está instalado.'
 
 /** Bounded polls per step: a local `test` answers at once, a clone and a render take longer. */
 const STEP_DEADLINES = { check: 15_000, install: 120_000, folder: 15_000, write: 180_000 }
@@ -326,6 +336,45 @@ async function runStep(
   }
 }
 
+/** What `ensureAlethe` answers: the skill is ready (and whether THIS call cloned it), or why not. */
+export type EnsureResult =
+  | { ok: true; installed: boolean }
+  | { ok: false; detail: string }
+
+/**
+ * The shared first step of `setupReport` and `startTask`: one check terminal (is the skill's
+ * orchestrate.py in place?) and, when it is missing, one install terminal (clone + copy) — the
+ * same two commands and their markers for both flows, never a copy of them. `installed` says
+ * whether THIS call cloned the skill; `detail` names which step refused, so an unreadable check
+ * never reads as a failed clone. A refused create or a missing workspace still throws: the
+ * caller answers it as data, exactly as `setupReport` always has.
+ */
+export async function ensureAlethe(host: Host): Promise<EnsureResult> {
+  const checked = await runStep(
+    host,
+    'alethe-report: check',
+    checkCommand(),
+    ['INSTALLED', 'MISSING'],
+    STEP_DEADLINES.check
+  )
+  const check = parseSetupCheck(checked)
+  if (check === 'failed') return { ok: false, detail: CHECK_FAILED_DETAIL }
+  if (check === 'missing') {
+    const installOutput = await runStep(
+      host,
+      'alethe-report: install',
+      installCommand(),
+      ['INSTALLED_OK', 'INSTALL_FAILED'],
+      STEP_DEADLINES.install
+    )
+    if (parseInstallOutput(installOutput) !== 'ok') {
+      return { ok: false, detail: INSTALL_FAILED_DETAIL }
+    }
+    return { ok: true, installed: true }
+  }
+  return { ok: true, installed: false }
+}
+
 /**
  * The whole one-click flow: check/install the skill, find a folder with a run, generate its
  * report. Three (or four) ephemeral terminals, each closed in its own `finally`, and every
@@ -335,34 +384,9 @@ async function runStep(
 export async function setupReport(host: Host): Promise<SetupResult> {
   let installed = false
   try {
-    const checked = await runStep(
-      host,
-      'alethe-report: check',
-      checkCommand(),
-      ['INSTALLED', 'MISSING'],
-      STEP_DEADLINES.check
-    )
-    const check = parseSetupCheck(checked)
-    if (check === 'failed') {
-      return {
-        status: 'failed',
-        installed,
-        detail: 'Não foi possível verificar se o alethe está instalado.'
-      }
-    }
-    if (check === 'missing') {
-      const installOutput = await runStep(
-        host,
-        'alethe-report: install',
-        installCommand(),
-        ['INSTALLED_OK', 'INSTALL_FAILED'],
-        STEP_DEADLINES.install
-      )
-      if (parseInstallOutput(installOutput) !== 'ok') {
-        return { status: 'failed', installed, detail: INSTALL_FAILED_DETAIL }
-      }
-      installed = true
-    }
+    const ensured = await ensureAlethe(host)
+    if (!ensured.ok) return { status: 'failed', installed, detail: ensured.detail }
+    installed = ensured.installed
     const folderOutput = await runStep(
       host,
       'alethe-report: runs',
@@ -397,5 +421,55 @@ export async function setupReport(host: Host): Promise<SetupResult> {
     return { status: 'failed', installed, detail: `orchestrate.py report falhou em ${folder}` }
   } catch (err) {
     return { status: 'failed', installed, detail: String(err) }
+  }
+}
+
+// --- start-task: the first step without friction — the panel dispatches the agent itself. ---
+
+/** The kickoff one task runs: the alethe skill, the NDS runbook and the task, in one line. */
+function kickoffOf(task: string): string {
+  return (
+    'Use a skill alethe para orquestrar a tarefa seguindo o runbook NDS em ' +
+    '~/.agents/skills/alethe/references/nds-runbook.md. ' +
+    `TAREFA: ${task}`
+  )
+}
+
+/**
+ * Dispatches the alethe agent for one task: ensure the skill, read the workspace and open the
+ * AGENT terminal carrying the kickoff. Unlike every other terminal in this file this one is NOT
+ * ephemeral and is never closed — it is the live session the user watches while the waves run,
+ * so closing it would kill the orchestration it just started (runStep's `finally` is exactly
+ * the anti-pattern this function must not inherit; that is why there is no `finally` here at
+ * all). The kickoff goes through `shellQuote`, so a task with `"`, `$()` or backticks stays
+ * data and never becomes shell syntax. Every failure — an empty task, an unreadable check, a
+ * refused clone, no workspace, a refused create — comes back as a `StartResult`, never thrown.
+ */
+export async function startTask(host: Host, task: string): Promise<StartResult> {
+  const trimmed = task.trim()
+  if (trimmed === '') {
+    // Before ANY host call: an empty field must not reach a terminal at all.
+    return { status: 'failed', detail: 'Escreva a tarefa antes de orquestrar.' }
+  }
+  try {
+    const ensured = await ensureAlethe(host)
+    if (!ensured.ok) return { status: 'failed', detail: ensured.detail }
+    const ctx = (await host.call('workspace.readContext', {})) as { workspaceId?: string } | null
+    const workspaceId = ctx?.workspaceId
+    if (!workspaceId) return { status: 'failed', detail: 'nenhum workspace focado' }
+    await host.call('terminal.create', {
+      workspaceId,
+      title: `alethe: ${trimmed.slice(0, 40)}`,
+      command: `opencode run ${shellQuote(kickoffOf(trimmed))}`
+    })
+    return {
+      status: 'started',
+      detail:
+        'Agente iniciado ✓ — acompanhe o terminal; o relatório aparecerá aqui quando as waves concluírem.'
+    }
+  } catch (err) {
+    // `err.message` rather than `String(err)`, so "nenhum workspace focado" reaches the panel
+    // verbatim instead of wearing an `Error: ` prefix.
+    return { status: 'failed', detail: err instanceof Error ? err.message : String(err) }
   }
 }

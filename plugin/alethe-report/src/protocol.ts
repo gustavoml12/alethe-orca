@@ -1,5 +1,5 @@
 // The panel <-> worker contract, declared once: src/panel.tsx and src/worker.ts both read it.
-import type { OpenResult, ReportList, SetupResult } from './reports'
+import type { OpenResult, ReportList, SetupResult, StartResult } from './reports'
 
 export {}
 
@@ -11,5 +11,7 @@ declare module 'orca' {
     'open-report': { input: { path: string }; output: OpenResult }
     /** Installs alethe when missing, finds the newest folder with runs and writes report.html there. */
     'setup-report': { output: SetupResult }
+    /** Dispatches the alethe agent for one task: a live agent terminal with the kickoff (never closed). */
+    'start-task': { input: { task: string }; output: StartResult }
   }
 }

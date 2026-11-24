@@ -18,6 +18,7 @@ import {
   parseSetupWrite,
   setupReport,
   shellQuote,
+  startTask,
   writeCommand,
   type Host
 } from './reports'
@@ -614,5 +615,224 @@ describe('marcadores dos comandos em shell real', () => {
     // sem nenhum resultado. O parser da instalação tem que recusar.
     const echoOnly = sh(`echo ${shellQuote(installCommand())}`)
     assert.equal(parseInstallOutput(echoOnly), 'failed', `eco real: ${JSON.stringify(echoOnly)}`)
+  })
+})
+
+// --- start-task: o primeiro passo sem atrito — o painel dispara o agente com o kickoff do alethe. ---
+//
+// O terminal do agente NÃO é efêmero (diferente do runStep): ele é a sessão viva que o usuário
+// acompanha, então nenhum caminho daqui pode fechá-lo.
+
+/** O runbook NDS que o kickoff aponta — caminho literal dentro do comando. */
+const RUNBOOK = '~/.agents/skills/alethe/references/nds-runbook.md'
+
+/** O kickoff exato da spec: skill + runbook + a tarefa, uma vez só. */
+function kickoffOf(task: string): string {
+  return (
+    `Use a skill alethe para orquestrar a tarefa seguindo o runbook NDS em ${RUNBOOK}. ` +
+    `TAREFA: ${task}`
+  )
+}
+
+/** Host onde o terminal de check responde `checkOutput`; cada create fica registrado. */
+function startHost(checkOutput: string): {
+  host: Host
+  created: Array<{ terminalId: string; command: string; title: string }>
+  closed: string[]
+} {
+  const created: Array<{ terminalId: string; command: string; title: string }> = []
+  const closed: string[] = []
+  let seq = 0
+  const host: Host = {
+    call: async (method, params) => {
+      if (method === 'workspace.readContext') return { workspaceId: 'w1' }
+      if (method === 'terminal.create') {
+        seq += 1
+        const record = {
+          terminalId: `t${seq}`,
+          command: String((params as { command?: string }).command ?? ''),
+          title: String((params as { title?: string }).title ?? '')
+        }
+        created.push(record)
+        return { terminalId: record.terminalId }
+      }
+      if (method === 'terminal.read') return { lines: [checkOutput], truncated: false }
+      if (method === 'terminal.close') {
+        closed.push(String((params as { terminalId?: string }).terminalId ?? ''))
+        return { closed: true }
+      }
+      return {}
+    }
+  }
+  return { host, created, closed }
+}
+
+describe('startTask sobre host injetado', () => {
+  test('tarefa vazia ou só espaços → failed antes de qualquer chamada ao host', async () => {
+    const { host, created } = startHost('INSTALLED')
+    for (const task of ['', '   ', '\n\t ']) {
+      const res = await startTask(host, task)
+      assert.equal(res.status, 'failed')
+      assert.equal(res.detail, 'Escreva a tarefa antes de orquestrar.')
+    }
+    assert.deepEqual(created, [], 'nenhum terminal criado na validação')
+  })
+
+  test('já instalado → create do agente com opencode run + tarefa + runbook, e sem close dele', async () => {
+    const { host, created, closed } = startHost('INSTALLED')
+    const res = await startTask(host, 'escrever o plano de testes')
+    assert.equal(res.status, 'started')
+    assert.match(res.detail, /Agente iniciado ✓/)
+    const agent = created.find((record) => record.command.includes('opencode run'))
+    assert.ok(agent, 'terminal do agente criado')
+    assert.ok(agent.command.includes('escrever o plano de testes'), 'a tarefa vai no comando')
+    assert.ok(agent.command.includes(RUNBOOK), 'o runbook vai no comando')
+    assert.ok(agent.title.startsWith('alethe: '), 'título nomeia o agente')
+    // O anti-pattern do runStep (fechar no finally) não pode vazar para cá.
+    assert.deepEqual(
+      closed.filter((terminalId) => terminalId === agent.terminalId),
+      [],
+      'o terminal do agente NUNCA é fechado'
+    )
+    assert.equal(closed.length, 1, 'só o terminal efêmero do check é fechado')
+  })
+
+  test('sequência real: o create do agente vem direto depois do workspace.readContext', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', CONTEXT)
+    tw.host.respond('terminal.create', (params: { command?: string }) => ({
+      terminalId: String(params.command ?? '').includes('opencode run') ? 'agent' : 'check'
+    }))
+    tw.host.respond('terminal.read', { lines: ['INSTALLED'], truncated: false })
+    tw.host.respond('terminal.close', { closed: true })
+    const res = await tw.request('start-task', { task: 'refatorar o setup' })
+    assert.equal(res.status, 'started')
+    const calls = tw.host.calls
+    const agentAt = calls.findIndex(
+      (call) =>
+        call.method === 'terminal.create' &&
+        String((call.params as { command?: string }).command ?? '').includes('opencode run')
+    )
+    assert.ok(agentAt > 0, 'create do agente registrado')
+    assert.equal(calls[agentAt - 1].method, 'workspace.readContext', 'readContext → create')
+    const closes = tw.host.callsOf('terminal.close') as Array<{ terminalId: string }>
+    assert.deepEqual(
+      closes.filter((close) => close.terminalId === 'agent'),
+      [],
+      'o terminal do agente sobrevive (nunca fechado)'
+    )
+    assert.equal(closes.length, 1, 'apenas o check efêmero foi fechado')
+    await tw.deactivate()
+  })
+
+  test('não instalado → o clone roda ANTES do terminal do agente', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', CONTEXT)
+    tw.host.respond('terminal.create', (params: { command?: string }) => {
+      const command = String(params.command ?? '')
+      if (command.includes('opencode run')) return { terminalId: 'agent' }
+      if (command.includes('git clone')) return { terminalId: 'install' }
+      return { terminalId: 'check' }
+    })
+    tw.host.respond('terminal.read', (params: { terminalId?: string }) => ({
+      lines: [params.terminalId === 'check' ? 'MISSING' : 'INSTALLED_OK'],
+      truncated: false
+    }))
+    tw.host.respond('terminal.close', { closed: true })
+    const res = await tw.request('start-task', { task: 'refatorar o módulo' })
+    assert.equal(res.status, 'started')
+    const commands = (tw.host.callsOf('terminal.create') as Array<{ command: string }>).map(
+      (record) => record.command
+    )
+    const cloneAt = commands.findIndex((command) => command.includes('git clone'))
+    const agentAt = commands.findIndex((command) => command.includes('opencode run'))
+    assert.ok(cloneAt !== -1, 'comando de instalação presente')
+    assert.ok(cloneAt < agentAt, 'instalação antes do agente')
+  })
+
+  test('instalação falhou → failed com a dica do gh auth e nenhum terminal do agente', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', CONTEXT)
+    tw.host.respond('terminal.create', (params: { command?: string }) => ({
+      terminalId: String(params.command ?? '').includes('git clone') ? 'install' : 'check'
+    }))
+    tw.host.respond('terminal.read', (params: { terminalId?: string }) => ({
+      lines: [params.terminalId === 'install' ? 'INSTALL_FAILED' : 'MISSING'],
+      truncated: false
+    }))
+    tw.host.respond('terminal.close', { closed: true })
+    const res = await tw.request('start-task', { task: 'qualquer coisa' })
+    assert.equal(res.status, 'failed')
+    assert.match(res.detail, /gh auth login/)
+    const commands = (tw.host.callsOf('terminal.create') as Array<{ command: string }>).map(
+      (record) => record.command
+    )
+    assert.deepEqual(
+      commands.filter((command) => command.includes('opencode run')),
+      [],
+      'sem terminal do agente'
+    )
+    await tw.deactivate()
+  })
+
+  test('sem workspace focado → failed com "nenhum workspace focado" e nenhum terminal', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', null)
+    const res = await tw.request('start-task', { task: 'qualquer coisa' })
+    assert.equal(res.status, 'failed')
+    assert.equal(res.detail, 'nenhum workspace focado')
+    assert.deepEqual(tw.host.callsOf('terminal.create'), [], 'sem terminal, sem shell')
+    await tw.deactivate()
+  })
+
+  test('a tarefa com " e $(whoami) vai entre aspas simples, nunca interpolada cru', async () => {
+    const task = 'acha o "bug" e roda $(whoami) e `id`'
+    const { host, created } = startHost('INSTALLED')
+    const res = await startTask(host, task)
+    assert.equal(res.status, 'started')
+    const agent = created.find((record) => record.command.includes('opencode run'))
+    assert.ok(agent, 'terminal do agente criado')
+    assert.equal(
+      agent.command,
+      `opencode run ${shellQuote(kickoffOf(task))}`,
+      'o kickoff inteiro passa pelo shellQuote'
+    )
+    assert.ok(!agent.command.includes('run $(whoami)'), '$(whoami) nunca cru fora das aspas')
+  })
+
+  test('o create recusado vira failed com a mensagem, nunca uma exceção', async () => {
+    const host: Host = {
+      call: async (method) => {
+        if (method === 'workspace.readContext') return { workspaceId: 'w1' }
+        if (method === 'terminal.create') throw new Error('capability_denied: terminal:send')
+        if (method === 'terminal.read') return { lines: ['INSTALLED'], truncated: false }
+        return {}
+      }
+    }
+    const res = await startTask(host, 'qualquer coisa')
+    assert.equal(res.status, 'failed')
+    assert.match(res.detail, /capability_denied/)
+  })
+})
+
+describe('start-task handler', () => {
+  test('tarefa vazia → failed sem nenhuma chamada ao host (nem terminal.create)', async () => {
+    const tw = await mountWorker(main)
+    const res = await tw.request('start-task', { task: '   ' })
+    assert.equal(res.status, 'failed')
+    assert.equal(res.detail, 'Escreva a tarefa antes de orquestrar.')
+    assert.deepEqual(tw.host.callsOf('terminal.create'), [], 'sem terminal.create')
+    assert.deepEqual(tw.host.callsOf('workspace.readContext'), [], 'validação antes de tudo')
+    await tw.deactivate()
+  })
+
+  test('falha chega como resposta (logada), nunca como exceção', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', null)
+    const res = await tw.request('start-task', { task: 'qualquer coisa' })
+    assert.equal(res.status, 'failed')
+    assert.match(res.detail, /workspace/)
+    assert.ok(tw.logs.some((line) => line.includes('start-task')), 'falha também vai para o log')
+    await tw.deactivate()
   })
 })

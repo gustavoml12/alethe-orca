@@ -4,6 +4,7 @@ import {
   Button,
   EmptyState,
   Heading,
+  Input,
   plugin,
   read,
   Row,
@@ -12,7 +13,7 @@ import {
   Text,
   update
 } from 'orca'
-import type { ReportList, SetupResult } from './reports'
+import type { ReportList, SetupResult, StartResult } from './reports'
 
 /** What the empty and error states show, worded exactly as the spec words it. */
 const INSTRUCTION = 'Rode `/alethe report html` no terminal do projeto'
@@ -51,6 +52,12 @@ const notes = atom<Record<string, { text: string; tone: 'success' | 'danger' }>>
 const setupNote = atom<{ text: string; tone: 'success' | 'danger' | 'accent' } | null>(null)
 /** Whether a setup run is in flight, so one click cannot start a second. */
 const setupBusy = atom(false)
+/** What the "Qual tarefa?" field holds; the text `start-task` receives. */
+const taskText = atom('')
+/** One "Orquestrar tarefa" answer, inline above the field; `null` when none. */
+const startNote = atom<{ text: string; tone: 'success' | 'danger' } | null>(null)
+/** Whether an agent dispatch is in flight, so one click cannot start a second. */
+const startBusy = atom(false)
 
 /** One list request end to end; `load` turns any failure into the error state. */
 async function refresh(): Promise<void> {
@@ -67,6 +74,42 @@ export async function runSetup(req: () => Promise<SetupResult>): Promise<SetupRe
     return await req()
   } catch (err) {
     return { status: 'failed', installed: false, detail: String(err) }
+  }
+}
+
+/**
+ * Pure: one `start-task` answer, with the request function injected so the seam tests without a
+ * host (same shape as `load` and `runSetup`). A rejected request becomes `failed` data — the
+ * frame never sees an exception.
+ */
+export async function runStart(req: () => Promise<StartResult>): Promise<StartResult> {
+  try {
+    return await req()
+  } catch (err) {
+    return { status: 'failed', detail: String(err) }
+  }
+}
+
+/**
+ * The "🚀 Orquestrar tarefa" press: one click that opens the live agent terminal with the
+ * alethe kickoff, so the person never has to know that `/alethe` is an agent command rather
+ * than a shell one. `started` clears the field (the task now belongs to the terminal); every
+ * outcome lands as an inline note — never a thrown exception — and the note is reset on the
+ * next click, the same discipline as `prepare`.
+ */
+async function start(): Promise<void> {
+  if (read(startBusy)) return
+  set(startBusy, true)
+  set(startNote, null)
+  try {
+    const result = await runStart(() => plugin.request('start-task', { task: read(taskText) }))
+    set(startNote, {
+      text: result.detail,
+      tone: result.status === 'started' ? 'success' : 'danger'
+    })
+    if (result.status === 'started') set(taskText, '')
+  } finally {
+    set(startBusy, false)
   }
 }
 
@@ -154,16 +197,39 @@ export default function Panel() {
   const allNotes = read(notes)
   const note = read(setupNote)
   const busy = read(setupBusy)
-  /** The one-click button; hidden while loading, drawn where a stale or absent list needs it. */
+  const task = read(taskText)
+  const starting = read(startBusy)
+  const dispatchNote = read(startNote)
+  /** The one-click setup button; hidden while loading, drawn where a stale or absent list needs it. Secondary to the dispatch button below. */
   const prepareButton = (size?: 'sm') => (
     <Button
       size={size ?? 'md'}
-      variant="solid"
+      variant="outline"
       disabled={busy}
       onPress={prepare}
     >
       ⚙️ Preparar e gerar relatório
     </Button>
+  )
+  /** The task field + dispatch button: the first step without friction (empty state only — a
+   *  ready state already has its report, so `Recarregar` suffices there). */
+  const dispatchRow = (
+    <Row gap="sm" align="end">
+      <Input
+        label="Qual tarefa?"
+        placeholder="Qual tarefa?"
+        value={task}
+        disabled={starting}
+        onChange={(value) => set(taskText, value)}
+      />
+      <Button
+        variant="solid"
+        disabled={starting || task.trim() === ''}
+        onPress={start}
+      >
+        🚀 Orquestrar tarefa
+      </Button>
+    </Row>
   )
   return (
     <Stack gap="md">
@@ -219,6 +285,12 @@ export default function Panel() {
               {current.message}
             </Text>
           )}
+          {current.kind === 'empty' && dispatchNote && (
+            <Text size="sm" tone={dispatchNote.tone}>
+              {dispatchNote.text}
+            </Text>
+          )}
+          {current.kind === 'empty' && dispatchRow}
           {prepareButton()}
           <EmptyState title="Nenhum relatório" description={current.instruction} icon="file-text" />
         </Stack>
