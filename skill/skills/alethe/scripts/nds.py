@@ -259,3 +259,33 @@ def notify(folder: Path, event: str, report: Optional[Dict[str, Any]] = None,
         except Exception:
             pass
         return 0
+
+
+def spec_rejected(folder: Path, report: Optional[Dict[str, Any]] = None,
+                  text: str = "") -> int:
+    """Count a spec rejection; abort (exit 2) on the third. Idempotent past the abort."""
+    path = folder / ATTEMPTS_FILE
+    try:
+        attempts = int(json.loads(path.read_text(encoding="utf-8")).get("attempts", 0))
+    except (OSError, ValueError):
+        attempts = 0
+    if attempts >= 3:
+        return 2  # já abortou; não repete comentário nem contador
+    attempts += 1
+    path.write_text(json.dumps({"attempts": attempts, "updatedAt": _now()}), encoding="utf-8")
+    detail = text or f"Reprovação {attempts} de 2 na validação das 5 categorias."
+    notify(folder, "spec-rejected", report, text=detail)
+    if attempts >= 3:
+        notify(folder, "abort", report,
+               text="Spec não aprovada em 2 tentativas; fluxo abortado. "
+                    "Reescreva a spec com a matriz completa antes de reabrir a issue.")
+        return 2
+    return 0
+
+
+def spec_approved(folder: Path, report: Optional[Dict[str, Any]] = None,
+                  text: str = "") -> int:
+    path = folder / ATTEMPTS_FILE
+    path.write_text(json.dumps({"attempts": 0, "updatedAt": _now()}), encoding="utf-8")
+    return notify(folder, "spec-approved", report,
+                  text=text or "Spec aprovada nas 5 categorias; liberado para o gate humano.")

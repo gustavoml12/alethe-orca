@@ -159,5 +159,28 @@ class NdsEventCliTest(unittest.TestCase):
         self.assertEqual(call.kwargs.get("text"), "fim da wave")
 
 
+class SpecAttemptsTest(unittest.TestCase):
+    def setUp(self):
+        self.folder = Path(tempfile.mkdtemp(prefix="nds-spec-"))
+
+    def test_third_rejection_aborts_once(self):
+        with mock.patch.object(nds, "notify", return_value=0) as notify:
+            self.assertEqual(nds.spec_rejected(self.folder), 0)   # 1ª
+            self.assertEqual(nds.spec_rejected(self.folder), 0)   # 2ª
+            self.assertEqual(nds.spec_rejected(self.folder), 2)   # 3ª -> aborta
+            self.assertEqual(nds.spec_rejected(self.folder), 2)   # repetida: não duplica
+        events = [c[0][1] for c in notify.call_args_list]
+        self.assertEqual(events.count("abort"), 1)
+        self.assertEqual(events.count("spec-rejected"), 3)
+        attempts = json.loads((self.folder / "spec_attempts.json").read_text())
+        self.assertEqual(attempts["attempts"], 3)
+
+    def test_spec_approved_resets_counter(self):
+        with mock.patch.object(nds, "notify", return_value=0):
+            nds.spec_rejected(self.folder)
+            nds.spec_approved(self.folder)
+            self.assertEqual(nds.spec_rejected(self.folder), 0)   # volta a contar de 1
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6378,6 +6378,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     nds_event_parser.add_argument("--text", default="")
     nds_event_parser.add_argument("--report", default=None,
                                   help="folder or run dir to build the tokens/models table from")
+    spec_parser = subparsers.add_parser(
+        "spec", help="NDS: record a spec validation result (counts rejections, max 2)")
+    spec_parser.add_argument("result", choices=["rejected", "approved"])
+    spec_parser.add_argument("--in", dest="into", metavar="FOLDER", default="current")
+    spec_parser.add_argument("--text", default="")
     report_parser = subparsers.add_parser(
         "report", help="explain what runs did, why, and what they reported spending"
     )
@@ -6699,6 +6704,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     report = None
             nds.notify(folder, args.event, report, text=args.text)
             return 0
+        if args.command == "spec":
+            if nds is None:
+                raise PlanError("NDS fork helpers are not installed (nds.py missing)")
+            folder = resolve_folder(None if args.into == "current" else Path(args.into))
+            if args.result == "rejected":
+                return nds.spec_rejected(folder, text=args.text)
+            return nds.spec_approved(folder, text=args.text)
         policy_path = (args.policy or default_policy_path()).expanduser().resolve()
         run_dir = args.run_dir
         folder: Optional[Path] = None
