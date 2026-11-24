@@ -2,7 +2,7 @@
 // exercises the pure helpers of src/reports.ts directly.
 import { assert, describe, mockHost, mountWorker, test } from 'orca/testing'
 import * as main from './worker'
-import { isReportPath, listReports, parseFindOutput, type Host } from './reports'
+import { findCommand, isReportPath, listReports, parseFindOutput, type Host } from './reports'
 
 /** What the mock host needs for `workspace.readContext`: the full host API shape. */
 const CONTEXT = {
@@ -34,6 +34,12 @@ describe('isReportPath', () => {
     assert.equal(isReportPath('/a/b/report.html'), true)
     assert.equal(isReportPath('/a/b/report.htmlx'), false)
     assert.equal(isReportPath('/a/b/Report.html'), false)
+  })
+})
+
+describe('findCommand', () => {
+  test('find command sorts newest-first via ls -t', () => {
+    assert.match(findCommand(), /ls -t/)
   })
 })
 

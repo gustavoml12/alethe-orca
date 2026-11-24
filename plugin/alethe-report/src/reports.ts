@@ -8,7 +8,7 @@ export type Host = {
   call(method: string, params: Record<string, unknown>): Promise<unknown>
 }
 
-/** `list-reports`' answer: the paths found (find order, at most 50), or why there are none. */
+/** `list-reports`' answer: the paths found (newest first, at most 50), or why there are none. */
 export type ReportList = { reports: Array<{ path: string }>; error?: string }
 
 /** `open-report`' answer; `via` says how it opened (Task 4 may add an editor tab to it). */
@@ -20,6 +20,14 @@ export type OpenResult = {
 
 /** Where Alethe's orchestrations (and each wave's report.html) live. */
 const ORCHESTRATIONS = '~/.config/alethe/orchestrations'
+
+/**
+ * `ls -t` sorts its arguments newest-first; `{} +` batches so the sort stays global across
+ * batches at our scale. Portable: works with BSD/macOS and GNU find alike.
+ */
+export function findCommand(): string {
+  return `find ${ORCHESTRATIONS} -name report.html -type f -exec ls -t {} + 2>/dev/null`
+}
 
 export function isReportPath(p: string): boolean {
   return p.endsWith('/report.html')
@@ -45,7 +53,8 @@ async function closeQuietly(host: Host, terminalId: string | undefined): Promise
   }
 }
 
-/** Runs `find` for report.html in a throwaway terminal and answers with its paths, at most 50. */
+/** Runs `find` for report.html in a throwaway terminal and answers with its paths, newest
+ *  first (`ls -t`), at most 50. */
 export async function listReports(host: Host): Promise<ReportList> {
   let terminalId: string | undefined
   try {
@@ -55,7 +64,7 @@ export async function listReports(host: Host): Promise<ReportList> {
     const created = (await host.call('terminal.create', {
       workspaceId,
       title: 'alethe-report: find',
-      command: `find ${ORCHESTRATIONS} -name report.html -type f 2>/dev/null`
+      command: findCommand()
     })) as { terminalId: string }
     terminalId = created.terminalId
     await sleep(1500)
