@@ -140,9 +140,26 @@ def _stdin_watcher(folder: Path, label: str) -> None:
         print(f"gate: {error}", flush=True)
 
 
+def _resolve_report(factory: Optional[Callable[[], Optional[Dict[str, Any]]]]) -> Optional[Dict[str, Any]]:
+    """Evaluate a lazy report factory; a raising factory degrades to no report."""
+    if factory is None:
+        return None
+    try:
+        return factory()
+    except Exception:
+        return None
+
+
 def gate_wait(folder: Path, label: str, timeout_hours: float = 24.0,
-              poll_seconds: float = 2.0) -> int:
+              poll_seconds: float = 2.0,
+              report_factory: Optional[Callable[[], Optional[Dict[str, Any]]]] = None) -> int:
     """Block until the gate for `label` is approved (0) or rejected/expired (3)."""
+    env_hours = os.environ.get(GATE_ENV_HOURS, "").strip()
+    if env_hours:
+        try:
+            timeout_hours = float(env_hours)
+        except ValueError:
+            pass
     existing = _read_gate(folder)
     if existing and existing.get("label") == label and existing.get("state") == "approved":
         return 0  # idempotente: retry não pausa de novo
@@ -150,7 +167,7 @@ def gate_wait(folder: Path, label: str, timeout_hours: float = 24.0,
         return 3
     _write_gate(folder, "waiting", label, "terminal")
     _prompt(label, folder)
-    notify(folder, "gate-waiting", None,
+    notify(folder, "gate-waiting", _resolve_report(report_factory),
            text=f"Wave `{label}` pausada; aguardando aprovação humana "
                 f"(libere com `orchestrate.py gate approve --in \"{folder}\"`).")
     threading.Thread(target=_stdin_watcher, args=(folder, label), daemon=True).start()
@@ -158,15 +175,16 @@ def gate_wait(folder: Path, label: str, timeout_hours: float = 24.0,
     while True:
         state = _read_gate(folder) or {}
         if state.get("state") == "approved":
-            notify(folder, "gate-approved", None, text=f"Wave `{label}` liberada.")
+            notify(folder, "gate-approved", _resolve_report(report_factory),
+                   text=f"Wave `{label}` liberada.")
             return 0
         if state.get("state") == "rejected":
-            notify(folder, "gate-rejected", None,
+            notify(folder, "gate-rejected", _resolve_report(report_factory),
                    text=f"Wave `{label}` abortada: recusada pelo usuário.")
             return 3
         if time.monotonic() > deadline:
             _write_gate(folder, "expired", label, "timeout")
-            notify(folder, "gate-rejected", None,
+            notify(folder, "gate-rejected", _resolve_report(report_factory),
                    text=f"Wave `{label}` abortada: gate expirou após {timeout_hours:g}h sem resposta.")
             print("NDS GATE: expirou sem resposta; abortando a wave.", flush=True)
             return 3
@@ -246,7 +264,14 @@ def notify(folder: Path, event: str, report: Optional[Dict[str, Any]] = None,
         repo = str(config.get("repo") or "").strip()
         if repo:
             cmd += ["--repo", repo]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            # glab ausente/quebrado/estourou timeout: preserva o comentário
+            # COMPLETO (tabela inclusive) localmente — só surpresas inesperadas
+            # caem no fallback de marcação única lá embaixo.
+            _append_pending(folder, event, body)
+            return 0
         if result.returncode != 0:
             _append_pending(folder, event, body)
             return 0
@@ -261,8 +286,21 @@ def notify(folder: Path, event: str, report: Optional[Dict[str, Any]] = None,
         return 0
 
 
+def pending_warning(folder: Path) -> Optional[str]:
+    """One-line summary when write-back events are queued locally, else None."""
+    path = folder / PENDING_FILE
+    try:
+        count = path.read_text(encoding="utf-8").count("\n## ")
+    except OSError:
+        return None
+    if count:
+        return f"NDS write-back: {count} evento(s) não enviados acumulados em {path}"
+    return None
+
+
 def spec_rejected(folder: Path, report: Optional[Dict[str, Any]] = None,
-                  text: str = "") -> int:
+                  text: str = "",
+                  report_factory: Optional[Callable[[], Optional[Dict[str, Any]]]] = None) -> int:
     """Count a spec rejection; abort (exit 2) on the third. Idempotent past the abort."""
     path = folder / ATTEMPTS_FILE
     try:
@@ -274,9 +312,10 @@ def spec_rejected(folder: Path, report: Optional[Dict[str, Any]] = None,
     attempts += 1
     path.write_text(json.dumps({"attempts": attempts, "updatedAt": _now()}), encoding="utf-8")
     detail = text or f"Reprovação {attempts} de 2 na validação das 5 categorias."
-    notify(folder, "spec-rejected", report, text=detail)
+    effective = report if report is not None else _resolve_report(report_factory)
+    notify(folder, "spec-rejected", effective, text=detail)
     if attempts >= 3:
-        notify(folder, "abort", report,
+        notify(folder, "abort", effective,
                text="Spec não aprovada em 2 tentativas; fluxo abortado. "
                     "Reescreva a spec com a matriz completa antes de reabrir a issue.")
         return 2
@@ -284,8 +323,10 @@ def spec_rejected(folder: Path, report: Optional[Dict[str, Any]] = None,
 
 
 def spec_approved(folder: Path, report: Optional[Dict[str, Any]] = None,
-                  text: str = "") -> int:
+                  text: str = "",
+                  report_factory: Optional[Callable[[], Optional[Dict[str, Any]]]] = None) -> int:
     path = folder / ATTEMPTS_FILE
     path.write_text(json.dumps({"attempts": 0, "updatedAt": _now()}), encoding="utf-8")
-    return notify(folder, "spec-approved", report,
+    effective = report if report is not None else _resolve_report(report_factory)
+    return notify(folder, "spec-approved", effective,
                   text=text or "Spec aprovada nas 5 categorias; liberado para o gate humano.")

@@ -6703,30 +6703,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 except Exception:
                     report = None
             nds.notify(folder, args.event, report, text=args.text)
+            warning = nds.pending_warning(folder)
+            if warning:
+                print(warning, file=sys.stderr)
             return 0
         if args.command == "spec":
             if nds is None:
                 raise PlanError("NDS fork helpers are not installed (nds.py missing)")
             folder = resolve_folder(None if args.into == "current" else Path(args.into))
             if args.result == "rejected":
-                return nds.spec_rejected(folder, text=args.text)
-            return nds.spec_approved(folder, text=args.text)
+                return nds.spec_rejected(
+                    folder, text=args.text,
+                    report_factory=lambda: build_report(wave_dirs(folder), folder))
+            return nds.spec_approved(
+                folder, text=args.text,
+                report_factory=lambda: build_report(wave_dirs(folder), folder))
         policy_path = (args.policy or default_policy_path()).expanduser().resolve()
         run_dir = args.run_dir
         folder: Optional[Path] = None
+        if args.into and run_dir is not None:
+            raise PlanError("pass --run-dir or --in, not both")
+        raw = read_json(args.plan)
         if args.into:
-            if run_dir is not None:
-                raise PlanError("pass --run-dir or --in, not both")
-            raw = read_json(args.plan)
             folder = resolve_folder(None if args.into == "current" else Path(args.into))
             run_dir = next_wave_dir(folder, raw.get("phase") if isinstance(raw, dict) else None)
-        if args.gate_before:
+        # NDS: a wave pode declarar o gate no próprio plan JSON ("gate": "human", spec RF-1);
+        # --gate-before continua funcionando e tem precedência sobre o campo.
+        # O relançamento --_background (run --in ... --detach) não re-avalia o gate:
+        # o parent já pausou/aprovou antes de destacar a wave.
+        gate_label = args.gate_before
+        if gate_label is None and not args._background and isinstance(raw, dict) and raw.get("gate") == "human":
+            gate_label = "human"
+        if gate_label:
             if nds is None:
                 raise PlanError("NDS fork helpers are not installed (nds.py missing)")
             if not args.into:
-                raise PlanError("--gate-before requires --in (an orchestration folder); "
-                                "a bare run has nowhere to keep the gate state")
-            gate_rc = nds.gate_wait(folder, args.gate_before)
+                raise PlanError("--gate-before or a plan with \"gate\": \"human\" requires --in "
+                                "(an orchestration folder); a bare run has nowhere to keep the gate state")
+            gate_rc = nds.gate_wait(folder, gate_label,
+                                    report_factory=lambda: build_report(wave_dirs(folder), folder))
             if gate_rc != 0:
                 return gate_rc
         if args.detach:
@@ -6744,6 +6759,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 report = None
             nds.notify(folder, "wave-done", report,
                        text=f"Wave terminou com exit {rc}.")
+            warning = nds.pending_warning(folder)
+            if warning:
+                print(warning, file=sys.stderr)
         return rc
     except PlanError as error:
         print(f"error: {error}", file=sys.stderr)

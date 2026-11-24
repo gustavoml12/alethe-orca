@@ -58,6 +58,19 @@ class GateStateTest(unittest.TestCase):
         state = json.loads((self.folder / "gate.json").read_text())
         self.assertEqual(state["state"], "expired")
 
+    def test_gate_hours_env_overrides_timeout(self):
+        # NDS_GATE_HOURS (anunciado no FORK-_DELTA) tem que valer mais que o
+        # default do parâmetro: 0.0001h expira antes do 2º poll (50s < 0.36s),
+        # enquanto o param 1h não expiraria — sem o env o side_effect estoura.
+        with mock.patch.dict("os.environ", {"NDS_GATE_HOURS": "0.0001"}), \
+             mock.patch.object(nds.time, "sleep"), \
+             mock.patch.object(nds, "_stdin_line", return_value=None), \
+             mock.patch.object(nds.time, "monotonic", side_effect=[0.0, 0.0, 50.0]):
+            rc = nds.gate_wait(self.folder, "exec", timeout_hours=1, poll_seconds=0)
+        self.assertEqual(rc, 3)
+        state = json.loads((self.folder / "gate.json").read_text())
+        self.assertEqual(state["state"], "expired")
+
     def test_reject_writes_rejected_state(self):
         nds.gate_approve(self.folder, "a")
         # rejeitar depois de aprovado é erro
@@ -129,6 +142,46 @@ class GateCliTest(unittest.TestCase):
             rc = self.orch_mod.main(["run", str(plan), "--in", str(folder), "--gate-before", "exec"])
         self.assertEqual(rc, 0)
         rb.assert_called_once()
+
+    def _write_gate_plan(self, folder):
+        (folder / "orchestration.json").write_text("{}")
+        plan = folder / "plan-gate.json"
+        plan.write_text(json.dumps({"version": 1, "gate": "human", "workers": [
+            {"id": "w", "provider": "claude", "cwd": ".", "mode": "read-only", "task": "x"}]}))
+        return plan
+
+    def _write_gate_state(self, folder, state):
+        (folder / "gate.json").write_text(json.dumps(
+            {"label": "human", "state": state, "createdAt": "x",
+             "resolvedAt": "y" if state != "waiting" else None, "by": "file"}))
+
+    def test_plan_declared_gate_blocks_when_rejected(self):
+        # plan JSON com "gate": "human" sem --gate-before: o runner tem que
+        # pausar na mesma (spec RF-1) e abortar sem chamar run_batch
+        folder = self.folder
+        plan = self._write_gate_plan(folder)
+        self._write_gate_state(folder, "rejected")
+        with mock.patch.object(self.orch_mod, "run_batch") as rb:
+            rc = self.orch_mod.main(["run", str(plan), "--in", str(folder)])
+        self.assertEqual(rc, 3)
+        rb.assert_not_called()
+
+    def test_plan_declared_gate_runs_when_approved(self):
+        folder = self.folder
+        plan = self._write_gate_plan(folder)
+        self._write_gate_state(folder, "approved")
+        with mock.patch.object(self.orch_mod, "run_batch", return_value=0) as rb:
+            rc = self.orch_mod.main(["run", str(plan), "--in", str(folder)])
+        self.assertEqual(rc, 0)
+        rb.assert_called_once()
+
+    def test_plan_declared_gate_requires_orchestration(self):
+        # sem --in não há onde guardar o gate: falha cedo, nunca roda sem gate
+        plan = self._write_gate_plan(self.folder)
+        with mock.patch.object(self.orch_mod, "run_batch") as rb:
+            rc = self.orch_mod.main(["run", str(plan)])
+        self.assertEqual(rc, 2)
+        rb.assert_not_called()
 
     def test_cli_works_without_nds_module(self):
         # compat: import guardado — main continua existindo sem nds

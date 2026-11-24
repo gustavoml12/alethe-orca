@@ -15,6 +15,10 @@ Arquivos modificados/criados em relação ao upstream (manter esta lista atualiz
 - skill/tests/test_nds_gate.py
 - skill/tests/test_nds_notify.py
 
+## Fora do skill/ (repo root)
+- `.github/workflows/ci.yml` — CI do fork: roda a suíte Python do runner (macOS/Ubuntu × Python 3.9/3.13) e o `check_playbooks.py`.
+- `.gitignore` — ignora `__pycache__/` e `*.pyc` gerados pelos testes e scripts.
+
 ## Auditoria: os 7 problemas resolvidos
 1. Handoff entre etapas sem mecanismo → runner do alethe controla as waves + write-back visível na issue (Tasks 3–5)
 2. Prompts gigantes embutidos em `--command` → briefs em arquivo no modelo do alethe; comandos do runbook curtos (Task 7)

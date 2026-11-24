@@ -28,6 +28,9 @@ Aprovação: digitar "sim" no terminal OU `orchestrate.py gate approve --in curr
 (em outro terminal; fica registrado na issue como gate-waiting/approved).
 
 ## Wave 3 — Executor (AGY / gemini-3.7-pro, write, MESMO worktree)
+O JSON do plano do executor deve carregar `"gate": "human"` no nível raiz: o runner pausa no
+gate humano mesmo sem a flag (o comando `--gate-before executor-approval` da seção ⛔ GATE
+HUMANO acima continua válido e tem precedência sobre o campo).
 Brief: "Leia o plano Y; TDD estrito (teste -> falha -> código -> passa), commits atômicos,
 marque os checkboxes [x]". isolate: false. Sem --dangerously-skip-permissions.
 defaultTimeoutSeconds: 2700.
@@ -40,3 +43,5 @@ Assessment". defaultTimeoutSeconds: 1800.
 ## Fim
     python3 skills/alethe/scripts/orchestrate.py nds-event final --in current --text "Ready to merge"
     python3 skills/alethe/scripts/orchestrate.py report --format html --in current  (abre o report)
+
+Se o `glab` faltar/falhar, os comentários acumulam em `writeback-pending.md` dentro da pasta de orquestração (`~/.config/alethe/orchestrations/<stamp>/`), e o runner avisa no fim da wave.
