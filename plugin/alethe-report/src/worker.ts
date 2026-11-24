@@ -3,7 +3,7 @@
 // src/reports.ts over ephemeral terminals, so each function closes its own terminal in a
 // `finally` and answers failures as data (never as an exception the panel would choke on).
 import type { OrcaWorkerApi } from 'orca/worker'
-import { listReports, openReport, type Host, type OpenResult, type ReportList } from './reports'
+import { isReportPath, listReports, openReport, type Host, type OpenResult, type ReportList } from './reports'
 
 export default function activate(orca: OrcaWorkerApi): void {
   // The pure module takes a plain host; the worker's API is typed per method, hence the cast.
@@ -19,6 +19,10 @@ export default function activate(orca: OrcaWorkerApi): void {
 
   orca.panels.handle('open-report', async (input): Promise<OpenResult> => {
     const path = String(input?.path ?? '')
+    // Defense in depth: only a report.html path ever reaches the shell command below.
+    if (!isReportPath(path)) {
+      return { opened: false, via: 'none', error: 'caminho não é um report.html' }
+    }
     const result = await openReport(host, path)
     if (result.error) orca.log(`open-report: ${result.error}`)
     return result

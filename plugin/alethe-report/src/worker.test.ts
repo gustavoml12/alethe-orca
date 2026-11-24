@@ -2,7 +2,15 @@
 // exercises the pure helpers of src/reports.ts directly.
 import { assert, describe, mockHost, mountWorker, test } from 'orca/testing'
 import * as main from './worker'
-import { findCommand, isReportPath, listReports, parseFindOutput, type Host } from './reports'
+import {
+  findCommand,
+  isReportPath,
+  judgeTabCreate,
+  listReports,
+  parseFindOutput,
+  shellQuote,
+  type Host
+} from './reports'
 
 /** What the mock host needs for `workspace.readContext`: the full host API shape. */
 const CONTEXT = {
@@ -40,6 +48,39 @@ describe('isReportPath', () => {
 describe('findCommand', () => {
   test('find command sorts newest-first via ls -t', () => {
     assert.match(findCommand(), /ls -t/)
+  })
+})
+
+describe('shellQuote', () => {
+  test('path with space and double quote goes into the command wrapped in single quotes', () => {
+    const path = '/tmp/my "dir"/report.html'
+    const command = `orca tab create --url ${shellQuote(`file://${path}`)} --json`
+    assert.ok(command.includes(`'file://${path}'`), 'caminho entre aspas simples')
+    assert.ok(!command.includes('--url "'), 'nunca aspas duplas como delimitador da URL')
+  })
+
+  test('escapes an embedded single quote as a closed-quoted sequence', () => {
+    assert.equal(shellQuote("it's"), `'it'\\''s'`)
+  })
+})
+
+describe('judgeTabCreate', () => {
+  test('"ok": true is success', () => {
+    assert.equal(judgeTabCreate('{"ok": true}').ok, true)
+  })
+
+  test('empty output is not success', () => {
+    assert.equal(judgeTabCreate('').ok, false)
+  })
+
+  test('"command not found" is not success', () => {
+    assert.equal(judgeTabCreate('command not found: orca').ok, false)
+  })
+
+  test('"ok": false fails and carries the error', () => {
+    const verdict = judgeTabCreate('{"ok": false, "error": "x"}')
+    assert.equal(verdict.ok, false)
+    assert.equal(verdict.error, '{"ok": false, "error": "x"}')
   })
 })
 
@@ -107,13 +148,13 @@ describe('open-report handler', () => {
     const tw = await mountWorker(main)
     tw.host.respond('workspace.readContext', CONTEXT)
     tw.host.respond('terminal.create', { terminalId: 't1' })
-    tw.host.respond('terminal.read', { lines: ['opened file:///x/report.html'], truncated: false })
+    tw.host.respond('terminal.read', { lines: ['{"ok": true}'], truncated: false })
     tw.host.respond('terminal.close', { closed: true })
     const res = await tw.request('open-report', { path: '/x/report.html' })
     assert.equal(res.opened, true)
     assert.equal(res.via, 'browser-tab')
     const create = tw.host.callsOf('terminal.create')[0] as { command: string }
-    assert.equal(create.command, 'orca tab create --url "file:///x/report.html"')
+    assert.equal(create.command, `orca tab create --url 'file:///x/report.html' --json`)
     assert.equal(tw.host.callsOf('terminal.close').length, 1)
     await tw.deactivate()
   })
@@ -122,7 +163,10 @@ describe('open-report handler', () => {
     const tw = await mountWorker(main)
     tw.host.respond('workspace.readContext', CONTEXT)
     tw.host.respond('terminal.create', { terminalId: 't1' })
-    tw.host.respond('terminal.read', { lines: ['Error: tab create refused'], truncated: false })
+    tw.host.respond('terminal.read', {
+      lines: ['{"ok": false, "error": "tab create refused"}'],
+      truncated: false
+    })
     tw.host.respond('terminal.close', { closed: true })
     const res = await tw.request('open-report', { path: '/x/report.html' })
     assert.equal(res.opened, false)
@@ -130,6 +174,16 @@ describe('open-report handler', () => {
     assert.match(res.error ?? '', /tab create refused/)
     assert.deepEqual(tw.host.callsOf('editor.open'), [], 'sem workspace:write não há fallback')
     assert.equal(tw.host.callsOf('terminal.close').length, 1)
+    await tw.deactivate()
+  })
+
+  test('rejects a path that is not report.html before any terminal is created', async () => {
+    const tw = await mountWorker(main)
+    const res = await tw.request('open-report', { path: '/etc/passwd' })
+    assert.equal(res.opened, false)
+    assert.equal(res.via, 'none')
+    assert.match(res.error ?? '', /report\.html/)
+    assert.deepEqual(tw.host.callsOf('terminal.create'), [], 'sem terminal.create, sem shell')
     await tw.deactivate()
   })
 })

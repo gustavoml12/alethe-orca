@@ -11,7 +11,7 @@ export type Host = {
 /** `list-reports`' answer: the paths found (newest first, at most 50), or why there are none. */
 export type ReportList = { reports: Array<{ path: string }>; error?: string }
 
-/** `open-report`' answer; `via` says how it opened (Task 4 may add an editor tab to it). */
+/** `open-report`' answer; `via` says how it opened (Task 4's `editor-tab` arm is RESERVED and unused: Task 4 decided the browser-tab works). */
 export type OpenResult = {
   opened: boolean
   via: 'browser-tab' | 'editor-tab' | 'none'
@@ -42,6 +42,15 @@ export function parseFindOutput(text: string): string[] {
 
 /** Bounded waits: a local `find` and `orca tab create` settle well inside these. */
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Wraps `value` in single quotes for the shell, escaping any embedded single quote as `'\''`.
+ * Interpolating a path unquoted lets `"`, `$` or backticks run arbitrary commands, so every
+ * value that reaches a command line goes through this helper.
+ */
+export function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
 
 /** Best effort: a failed close must not mask the result the caller already has. */
 async function closeQuietly(host: Host, terminalId: string | undefined): Promise<void> {
@@ -82,10 +91,24 @@ export async function listReports(host: Host): Promise<ReportList> {
 }
 
 /**
- * Opens one report.html in a browser tab through `orca tab create --url file://…`.
+ * Decides from `orca tab create --json` output whether the tab opened. Success is ONLY a
+ * literal `"ok": true`; empty output, `command not found` and `"ok": false` all fail, and the
+ * failure carries the trimmed output so the panel can show what the terminal actually said.
+ */
+export function judgeTabCreate(output: string): { ok: boolean; error?: string } {
+  if (/"ok"\s*:\s*true\b/.test(output)) return { ok: true }
+  return { ok: false, error: output.trim() }
+}
+
+/**
+ * Opens one report.html in a browser tab through `orca tab create --url file://… --json`.
+ * The path is shell-quoted (a name with spaces, `"` or `$` must never become shell syntax) and
+ * success is judged only from the command's JSON, polled until it answers or 5s elapse — an
+ * empty read on a slow machine, or `command not found` when orca is off PATH, is a failure.
  * No `editor.open` fallback here: the manifest has no workspace:write, so that call would be
  * `capability_denied` at runtime; when the terminal reports failure the answer carries what it
- * said and `via` stays 'none' (plan Task 4 decides on a fallback).
+ * said and `via` stays 'none' (the `editor-tab` arm of `via` is RESERVED and unused: Task 4
+ * decided the browser-tab works).
  */
 export async function openReport(host: Host, path: string): Promise<OpenResult> {
   let terminalId: string | undefined
@@ -96,18 +119,27 @@ export async function openReport(host: Host, path: string): Promise<OpenResult> 
     const created = (await host.call('terminal.create', {
       workspaceId,
       title: 'alethe-report: open',
-      command: `orca tab create --url "file://${path}"`
+      command: `orca tab create --url ${shellQuote(`file://${path}`)} --json`
     })) as { terminalId: string }
     terminalId = created.terminalId
-    await sleep(1200)
-    const read = (await host.call('terminal.read', {
-      terminalId,
-      maxLines: 50
-    })) as { lines: string[] }
-    const out = read.lines.join('\n')
-    if (/error|refused|invalid/i.test(out)) {
-      return { opened: false, via: 'none', error: out }
+    // Poll instead of a fixed sleep: slow machines need longer than one shot, and a read that
+    // is still empty when the deadline passes is "no answer", never success.
+    const deadline = Date.now() + 5000
+    let out = ''
+    for (;;) {
+      await sleep(400)
+      const read = (await host.call('terminal.read', {
+        terminalId,
+        maxLines: 50
+      })) as { lines: string[] }
+      out = read.lines.join('\n')
+      if (out.trim() !== '' || Date.now() >= deadline) break
     }
+    if (out.trim() === '') {
+      return { opened: false, via: 'none', error: 'sem resposta do orca tab create' }
+    }
+    const verdict = judgeTabCreate(out)
+    if (!verdict.ok) return { opened: false, via: 'none', error: verdict.error }
     return { opened: true, via: 'browser-tab' }
   } catch (err) {
     return { opened: false, via: 'none', error: String(err) }
