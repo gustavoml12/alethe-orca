@@ -13,6 +13,14 @@ orca plugin dev request . open-report --data '{"path":"/home/you/.config/alethe/
 - Comportamento: `browser-tab` (`via` no retorno de `open-report`)
 - Motivo: o browser embutido do Orca aceita o scheme `file://` e renderiza a página (`loaded: true`, `loadError: null`), então o caminho da spec — aba de browser — é o que o código já faz: nenhum fallback foi necessário, `openReport` segue **sem** `editor.open` e uma falha do terminal continua respondendo `via: "none"` com o `error` lido. Fora de um terminal do Orca o mesmo comando recusou com `selector_ambiguous` (`More than one Orca workspace matched the current directory. Choose an exact workspace.` — 6 folder workspaces duplicados no cwd `Projetos_ebnez`): é resolução de workspace, não recusa do scheme; dentro do terminal do Orca, onde o worker roda, o contexto resolve sozinho.
 
+## Instalar
+
+```bash
+orca plugin install ./plugin/alethe-report --json   # exit 3 → approval_required: re-run com o --approve que o Orca imprimir
+# desenvolvimento:
+orca plugin dev load ./plugin/alethe-report --json
+```
+
 ## Develop
 
 ```sh
