@@ -1,8 +1,10 @@
 // Runs src/worker.ts's activate(orca) with the orca object Orca passes, over a mock host, and
 // exercises the pure helpers of src/reports.ts directly.
 import { assert, describe, mockHost, mountWorker, test } from 'orca/testing'
+import { execSync } from 'node:child_process'
 import * as main from './worker'
 import {
+  checkCommand,
   findCommand,
   folderCommand,
   installCommand,
@@ -10,6 +12,7 @@ import {
   judgeTabCreate,
   listReports,
   parseFindOutput,
+  parseInstallOutput,
   parseSetupCheck,
   parseSetupFolder,
   parseSetupWrite,
@@ -248,6 +251,32 @@ function flowScript(step: {
   }
 }
 
+// Instalação é julgada só pelo marcador completo: um eco do comando (ou um clone que estourou
+// o prazo) não pode passar por "instalado" só porque a fonte carrega a palavra INSTALLED.
+describe('parseInstallOutput', () => {
+  test('INSTALLED_OK → ok', () => {
+    assert.equal(parseInstallOutput('...\nINSTALLED_OK\n'), 'ok')
+  })
+
+  test('INSTALLED sozinho (eco de echo-only/timeout) → failed', () => {
+    assert.equal(parseInstallOutput('INSTALLED'), 'failed')
+    assert.equal(parseInstallOutput('echo INSTALLED\n'), 'failed')
+  })
+
+  test('vazio e INSTALL_FAILED → failed', () => {
+    assert.equal(parseInstallOutput(''), 'failed')
+    assert.equal(parseInstallOutput('git clone: fatal\nINSTALL_FAILED\n'), 'failed')
+  })
+
+  test('regressão: a linha de eco antiga, que traz INSTALLED literal, não passa como ok', () => {
+    // O código antigo gerava `echo INSTALLED"_"OK`: o parser velho via só `INSTALLED` e
+    // respondia "instalado" a partir do eco, sem nenhum resultado real.
+    const oldEcho = 'rm -rf /tmp/x && echo INSTALLED"_"OK || echo INSTALL"_"FAILED'
+    assert.equal(parseInstallOutput(oldEcho), 'failed')
+    assert.equal(parseInstallOutput(`${oldEcho}\nINSTALLED_OK`), 'ok')
+  })
+})
+
 describe('parseSetupCheck', () => {
   test('INSTALLED e INSTALLED_OK contam como instalado', () => {
     assert.equal(parseSetupCheck('INSTALLED'), 'installed')
@@ -446,5 +475,98 @@ describe('setup-report handler', () => {
     assert.match(res.detail, /gh auth login/)
     assert.deepEqual(tw.host.callsOf('terminal.create').length, 2, 'para depois do clone')
     await tw.deactivate()
+  })
+})
+
+// --- Marcadores que um shell de verdade tem que conseguir produzir. ---
+//
+// Os mocks devolvem strings desenhadas, então qualquer bug na FONTE do comando passa batido.
+// Aqui o comando roda num shell real e a fonte é inspecionada: é a classe de bug em que
+// `echo MISS"_"ING` imprimia `MISS_ING` (o `_` entre aspas é literal) e todo o setup morria.
+
+/** Todos os marcadores completos que os parsers esperam ver, um por passo. */
+const FULL_MARKERS = [
+  'INSTALLED_OK',
+  'INSTALL_FAILED',
+  'NO_ORCH',
+  'NO_RUNS',
+  'FOLDER=',
+  'WROTE_OK',
+  'WROTE_FAIL',
+  'INSTALLED',
+  'MISSING'
+] as const
+
+/** Colapsa as aspas vazias de volta: é o texto que a fonte do comando "quer dizer". */
+function collapsed(command: string): string {
+  return command.replace(/""/g, '')
+}
+
+describe('marcadores dos comandos em shell real', () => {
+  test('checkCommand produz um marcador que um shell real consegue ecoar', () => {
+    // O alethe pode ou não estar instalado na máquina que roda os testes — os dois casos são
+    // válidos. O que NUNCA pode acontecer é o parse 'failed' que o bug do sublinhado causava.
+    const out = execSync(`sh -c ${JSON.stringify(checkCommand())}`, { encoding: 'utf8' })
+    assert.notEqual(parseSetupCheck(out), 'failed', `saída real: ${JSON.stringify(out)}`)
+  })
+
+  test('nenhuma fonte carrega um marcador completo (o eco do comando nunca casa)', () => {
+    const sources = [
+      ['checkCommand', checkCommand()],
+      ['installCommand', installCommand()],
+      ['folderCommand', folderCommand()],
+      ['writeCommand', writeCommand(FOLDER)]
+    ] as const
+    for (const [name, source] of sources) {
+      for (const marker of FULL_MARKERS) {
+        assert.ok(
+          !source.includes(marker),
+          `${name} não pode conter o marcador completo ${marker} na fonte: ${source}`
+        )
+      }
+    }
+  })
+
+  test('colapsar "" nos argumentos de echo revela exatamente os marcadores esperados', () => {
+    assert.ok(collapsed(checkCommand()).includes('echo INSTALLED'), 'INSTAL""LED → INSTALLED')
+    assert.ok(collapsed(checkCommand()).includes('echo MISSING'), 'MISS""ING → MISSING')
+    assert.ok(collapsed(installCommand()).includes('echo INSTALLED_OK'))
+    assert.ok(collapsed(installCommand()).includes('echo INSTALL_FAILED'))
+    assert.ok(collapsed(folderCommand()).includes('echo NO_ORCH'))
+    assert.ok(collapsed(folderCommand()).includes('echo NO_RUNS'))
+    assert.ok(collapsed(folderCommand()).includes('FOLDER=$f'))
+    assert.ok(collapsed(writeCommand(FOLDER)).includes('echo WROTE_OK'))
+    assert.ok(collapsed(writeCommand(FOLDER)).includes('echo WROTE_FAIL'))
+  })
+
+  test('regressão: nenhuma fonte usa o split antigo com sublinhado literal', () => {
+    // No código antigo `INSTAL"_"ED` imprimia `INSTAL_ED` e `MISS"_"ING` imprimia `MISS_ING`.
+    assert.ok(!checkCommand().includes('INSTAL"_"ED'), 'o split antigo nunca volta')
+    assert.ok(!checkCommand().includes('MISS"_"ING'), 'o split antigo nunca volta')
+    assert.ok(!installCommand().includes('INSTALLED"_"'), 'o split antigo nunca volta')
+    assert.ok(!installCommand().includes('INSTALL"_"FAILED'), 'o split antigo nunca volta')
+    assert.ok(!folderCommand().includes('NO"_"ORCH'), 'o split antigo nunca volta')
+    assert.ok(!folderCommand().includes('NO"_"RUNS'), 'o split antigo nunca volta')
+    assert.ok(!folderCommand().includes('FOLDER"="'), 'o split antigo nunca volta')
+    assert.ok(!writeCommand(FOLDER).includes('WROTE"_"'), 'o split antigo nunca volta')
+  })
+
+  test('folderCommand num shell real produz um marcador reconhecido (NO_ORCH/NO_RUNS/FOLDER=)', () => {
+    const out = execSync(`sh -c ${JSON.stringify(folderCommand())}`, { encoding: 'utf8' })
+    const parsed = parseSetupFolder(out)
+    assert.ok(
+      ['NO_ORCH', 'NO_RUNS', 'FOLDER='].some((marker) => out.includes(marker)),
+      `saída real sem marcador reconhecido: ${JSON.stringify(out)}`
+    )
+    // O tipo vem do que o shell imprimiu, nunca de "não achei nada" genérico.
+    assert.ok(['no-orch', 'no-runs', 'found'].includes(parsed.kind))
+  })
+
+  test('writeCommand num shell real produz WROTE_FAIL (o report não existe), nunca lixo', () => {
+    const out = execSync(`sh -c ${JSON.stringify(writeCommand('/tmp/alethe-no-such-folder'))}`, {
+      encoding: 'utf8'
+    })
+    assert.equal(parseSetupWrite(out), false)
+    assert.ok(out.includes('WROTE_FAIL'), `saída real: ${JSON.stringify(out)}`)
   })
 })

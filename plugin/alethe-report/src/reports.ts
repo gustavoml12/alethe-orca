@@ -164,14 +164,19 @@ export async function openReport(host: Host, path: string): Promise<OpenResult> 
 
 // --- One-click setup: install the skill when it is missing, then generate the report. ---
 //
-// Every marker below is SPLIT inside the command itself (`echo MISS"_"ING`): a terminal echoes
-// what it ran back into its own output, and a complete token in the command line would match
-// before the command had produced anything. Split, the echo can never carry a whole marker, so
-// only the command's own words decide — both for the poll that waits and for the parsers.
+// Every marker below is BROKEN INSIDE the command itself with empty quotes (`echo MISS""ING`):
+// a terminal echoes what it ran back into its own output, and a complete token in the command
+// line would match before the command had produced anything. `""` splits the word in the
+// echoed SOURCE (so the echo can never carry a whole marker) while the shell prints the clean
+// word: `MISS""ING` prints `MISSING`. The old `MISS"_"ING` was WRONG — the `_` inside quotes
+// is literal, so the shell printed `MISS_ING`, the first poll always ran to its deadline and
+// the whole button died on "Não foi possível verificar…". The same `X"_"Y` pattern also left
+// complete tokens (a literal `INSTALLED`) in the echoed source, which is why the install step
+// is parsed by `parseInstallOutput` below and never by the bare word.
 
 /** Step 1: is the skill's orchestrate.py already installed? */
 export function checkCommand(): string {
-  return `test -f ${ALETHE_SKILL}/scripts/orchestrate.py && echo INSTAL"_"ED || echo MISS"_"ING`
+  return `test -f ${ALETHE_SKILL}/scripts/orchestrate.py && echo INSTAL""LED || echo MISS""ING`
 }
 
 /**
@@ -183,7 +188,7 @@ export function installCommand(): string {
   return (
     'rm -rf /tmp/alethe-setup-$$ && git clone --depth 1 https://github.com/gustavoml12/alethe-orca /tmp/alethe-setup-$$ >/dev/null 2>&1 && ' +
     `mkdir -p ~/.agents/skills && rm -rf ${ALETHE_SKILL} && cp -r /tmp/alethe-setup-$$/skill/skills/alethe ${ALETHE_SKILL} && ` +
-    'rm -rf /tmp/alethe-setup-$$ && echo INSTALLED"_"OK || echo INSTALL"_"FAILED'
+    'rm -rf /tmp/alethe-setup-$$ && echo INSTAL""LED_OK || echo INSTALL""_FAILED'
   )
 }
 
@@ -191,7 +196,7 @@ export function installCommand(): string {
 export function folderCommand(): string {
   return (
     `f=$(ls -td ${ORCHESTRATIONS}/*/ 2>/dev/null | head -1); ` +
-    'if [ -z "$f" ]; then echo NO"_"ORCH; elif [ -f "$f/state.json" ] || ls "$f"*/state.json >/dev/null 2>&1; then echo FOLDER"="$f; else echo NO"_"RUNS; fi'
+    'if [ -z "$f" ]; then echo NO""_ORCH; elif [ -f "$f/state.json" ] || ls "$f"*/state.json >/dev/null 2>&1; then echo FOLDER""=$f; else echo NO""_RUNS; fi'
   )
 }
 
@@ -206,7 +211,7 @@ export function writeCommand(folder: string): string {
   return (
     `python3 ${ALETHE_SKILL}/scripts/orchestrate.py report ${shellQuote(folder)} --format html ` +
     `--write ${shellQuote(report)} --no-open >/dev/null 2>&1 && test -f ${shellQuote(report)} ` +
-    '&& echo WROTE"_"OK || echo WROTE"_"FAIL'
+    '&& echo WROTE""_OK || echo WROTE""_FAIL'
   )
 }
 
@@ -236,6 +241,15 @@ export function parseSetupCheck(output: string): SetupCheck {
   if (marker === 'MISSING') return 'missing'
   if (marker === 'INSTALLED_OK' || marker === 'INSTALLED') return 'installed'
   return 'failed'
+}
+
+/**
+ * Step 1's install verdict — stricter than `parseSetupCheck` on purpose. Only the two markers
+ * the install command itself prints count: a bare `INSTALLED` (the echo of a command, or the
+ * tail of a timed-out clone) is never an install, so an echo-only read can't false-positive.
+ */
+export function parseInstallOutput(output: string): 'ok' | 'failed' {
+  return lastMarker(output, ['INSTALLED_OK', 'INSTALL_FAILED']) === 'INSTALLED_OK' ? 'ok' : 'failed'
 }
 
 /** What step 2's output says: no folder at all, a folder without a run, or the folder to use. */
@@ -344,7 +358,7 @@ export async function setupReport(host: Host): Promise<SetupResult> {
         ['INSTALLED_OK', 'INSTALL_FAILED'],
         STEP_DEADLINES.install
       )
-      if (parseSetupCheck(installOutput) !== 'installed') {
+      if (parseInstallOutput(installOutput) !== 'ok') {
         return { status: 'failed', installed, detail: INSTALL_FAILED_DETAIL }
       }
       installed = true
