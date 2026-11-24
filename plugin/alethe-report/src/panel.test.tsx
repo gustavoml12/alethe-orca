@@ -439,3 +439,172 @@ describe('campo de tarefa no estado vazio', () => {
     await view.unmount()
   })
 })
+
+// --- Seção "Issues abertas": as issues do projeto disparam a orquestração com dry-run. ---
+
+const ISSUES_HEADING = 'Issues abertas'
+/** O botão 🚀 de UMA linha de issue (o da tarefa é "🚀 Orquestrar tarefa", texto diferente). */
+const ISSUE_BUTTON = { role: 'button', text: '🚀' }
+
+/** Uma issue qualquer para os testes da seção. */
+const ISSUE = {
+  number: 42,
+  title: 'Corrigir o write-back dual-forge',
+  url: 'https://gitlab.com/grp/proj/-/issues/42',
+  labels: [] as string[]
+}
+
+describe('loadIssues (lógica da seção de issues)', () => {
+  test('resposta do worker passa adiante como está', async () => {
+    const state = await panel.loadIssues(async () => ({ issues: [ISSUE] }))
+    assert.deepEqual(state.issues, [ISSUE])
+    assert.equal(state.error, undefined)
+  })
+
+  test('resposta com error do worker → error como dado, nunca exceção', async () => {
+    const state = await panel.loadIssues(async () => ({ issues: [], error: 'workspace sem remote git' }))
+    assert.deepEqual(state.issues, [])
+    assert.match(state.error ?? '', /workspace sem remote git/)
+  })
+
+  test('request rejeitada → error como dado, nunca exceção (Focus 4)', async () => {
+    const state = await panel.loadIssues(async () => {
+      throw new Error('worker off')
+    })
+    assert.deepEqual(state.issues, [])
+    assert.match(state.error ?? '', /worker off/)
+  })
+})
+
+describe('seção Issues abertas no painel', () => {
+  test('issues renderizadas como #n título [labels] com 🚀 por linha', async () => {
+    const host = mockHost({
+      requests: {
+        'list-reports': () => ({ reports: [{ path: '/o1/report.html' }] }),
+        'list-issues': () => ({ issues: [ISSUE, { ...ISSUE, number: 7, title: 'Outra', labels: ['bug'] }] })
+      }
+    })
+    const view = await mount(panel, { host })
+    assert.ok(view.find({ text: ISSUES_HEADING }), 'título da seção visível')
+    assert.ok(view.find({ text: '#42 Corrigir o write-back dual-forge' }), 'linha da issue')
+    assert.ok(view.find({ text: '#7 Outra [bug]' }), 'linha com labels')
+    assert.equal(view.findAll(ISSUE_BUTTON).length, 2, 'um 🚀 por issue')
+    assert.deepEqual(view.errors, [])
+    await view.unmount()
+  })
+
+  test('zero issues → a seção some, sem erros nem notas', async () => {
+    const host = mockHost({
+      requests: {
+        'list-reports': () => ({ reports: [] }),
+        'list-issues': () => ({ issues: [] })
+      }
+    })
+    const view = await mount(panel, { host })
+    assert.equal(view.find({ text: ISSUES_HEADING }), null, 'sem issues não há seção')
+    assert.equal(view.find(ISSUE_BUTTON), null)
+    assert.deepEqual(view.errors, [])
+    await view.unmount()
+  })
+
+  test('🚀 da issue → start-issue com number/title/url + nota de sucesso', async () => {
+    const sent: Array<{ number: number; title: string; url: string }> = []
+    const host = mockHost({
+      requests: {
+        'list-reports': () => ({ reports: [{ path: '/o1/report.html' }] }),
+        'list-issues': () => ({ issues: [ISSUE] }),
+        'start-issue': (input) => {
+          sent.push(input)
+          return {
+            status: 'started' as const,
+            detail: 'Agente iniciado ✓ — acompanhe o terminal; o relatório aparecerá aqui quando as waves concluírem.'
+          }
+        }
+      }
+    })
+    const view = await mount(panel, { host })
+    await view.press(ISSUE_BUTTON)
+    assert.deepEqual(sent, [{ number: 42, title: ISSUE.title, url: ISSUE.url }], 'start-issue recebe a issue da linha')
+    assert.ok(view.find({ text: /Agente iniciado ✓/ }), 'nota de sucesso visível')
+    assert.deepEqual(view.errors, [], 'nunca exceção no frame')
+    await view.unmount()
+  })
+
+  test('falha do start-issue → nota danger na linha, campo de tarefa intacto', async () => {
+    const host = mockHost({
+      requests: {
+        'list-reports': () => ({ reports: [] }),
+        'list-issues': () => ({ issues: [ISSUE] }),
+        'start-issue': () => ({ status: 'failed' as const, detail: 'Escolha uma issue primeiro.' })
+      }
+    })
+    const view = await mount(panel, { host })
+    await view.press(ISSUE_BUTTON)
+    const note = view.find({ text: /Escolha uma issue primeiro/ })
+    assert.ok(note, 'nota de falha visível')
+    assert.equal(note.props.tone, 'danger', 'tom destrutivo')
+    assert.ok(view.find({ label: TASK_LABEL }), 'o campo de tarefa segue ali (fallback)')
+    assert.deepEqual(view.errors, [], 'nunca exceção no frame')
+    await view.unmount()
+  })
+
+  test('request do start-issue rejeitada → nota danger, sem exceção no frame', async () => {
+    const host = mockHost({
+      requests: {
+        'list-reports': () => ({ reports: [{ path: '/o1/report.html' }] }),
+        'list-issues': () => ({ issues: [ISSUE] }),
+        'start-issue': () => {
+          throw hostError('unavailable', 'worker off')
+        }
+      }
+    })
+    const view = await mount(panel, { host })
+    await view.press(ISSUE_BUTTON)
+    assert.ok(view.find({ text: /worker off/ }), 'falha da request vira nota, não exceção')
+    assert.deepEqual(view.errors, [], 'nunca exceção no frame')
+    await view.unmount()
+  })
+
+  test('list-issues falha → nota pequena na área da seção, painel segue desenhando', async () => {
+    const host = mockHost({
+      requests: {
+        'list-reports': () => ({ reports: [{ path: '/o1/report.html' }] }),
+        'list-issues': () => {
+          throw hostError('unavailable', 'worker off')
+        }
+      }
+    })
+    const view = await mount(panel, { host })
+    assert.ok(view.find({ text: /worker off/ }), 'nota da falha de issues visível')
+    assert.equal(view.find({ text: ISSUES_HEADING }), null, 'sem issues não há seção')
+    assert.ok(view.find({ text: 'o1/report.html' }), 'a lista de relatórios segue intacta')
+    assert.equal(view.find({ text: INSTRUCTION }), null, 'não é estado vazio: há relatório')
+    assert.deepEqual(view.errors, [], 'nunca exceção no frame')
+    await view.unmount()
+  })
+
+  test('mount e Recarregar pedem as DUAS listas', async () => {
+    let reportLists = 0
+    let issueLists = 0
+    const host = mockHost({
+      requests: {
+        'list-reports': () => {
+          reportLists += 1
+          return { reports: [] }
+        },
+        'list-issues': () => {
+          issueLists += 1
+          return { issues: [] }
+        }
+      }
+    })
+    const view = await mount(panel, { host })
+    assert.equal(reportLists, 1, 'list-reports no mount')
+    assert.equal(issueLists, 1, 'list-issues no mount')
+    await view.press({ text: 'Recarregar' })
+    assert.equal(reportLists, 2, 'list-reports no reload')
+    assert.equal(issueLists, 2, 'list-issues no reload')
+    assert.deepEqual(view.errors, [])
+    await view.unmount()
+  })
+})

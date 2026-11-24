@@ -1,5 +1,5 @@
 // The panel <-> worker contract, declared once: src/panel.tsx and src/worker.ts both read it.
-import type { OpenResult, ReportList, SetupResult, StartResult } from './reports'
+import type { IssueList, OpenResult, ReportList, SetupResult, StartResult } from './reports'
 
 export {}
 
@@ -13,5 +13,9 @@ declare module 'orca' {
     'setup-report': { output: SetupResult }
     /** Dispatches the alethe agent for one task: a live agent terminal with the kickoff (never closed). */
     'start-task': { input: { task: string }; output: StartResult }
+    /** Lists the project's open issues (at most 20) from gh or glab, chosen by the git remote. */
+    'list-issues': { output: IssueList }
+    /** Dispatches the alethe agent for one issue row: kickoff with dry-run + approval hold (terminal never closed). */
+    'start-issue': { input: { number: number; title: string; url: string }; output: StartResult }
   }
 }

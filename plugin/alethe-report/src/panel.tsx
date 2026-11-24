@@ -13,7 +13,7 @@ import {
   Text,
   update
 } from 'orca'
-import type { ReportList, SetupResult, StartResult } from './reports'
+import type { IssueItem, IssueList, ReportList, SetupResult, StartResult } from './reports'
 
 /** What the empty and error states show: the new flow's first step, never a shell command. */
 const INSTRUCTION = 'Sem relatórios ainda — escreva a tarefa acima e clique em 🚀 Orquestrar tarefa.'
@@ -44,8 +44,27 @@ export async function load(req: () => Promise<ReportList>): Promise<PanelState> 
   }
 }
 
+/** What the "Issues abertas" section draws: the rows found, or why there are none. */
+export type IssuesState = { issues: IssueItem[]; error?: string }
+
+/**
+ * Pure: maps one `list-issues` answer to the section's state, with the request function
+ * injected (same shape as `load`). A rejected request or the worker's own `error` field lands
+ * here as data — a broken issues list never takes the panel down with it.
+ */
+export async function loadIssues(req: () => Promise<IssueList>): Promise<IssuesState> {
+  try {
+    const answer = await req()
+    return answer.error ? { issues: answer.issues ?? [], error: answer.error } : { issues: answer.issues ?? [] }
+  } catch (err) {
+    return { issues: [], error: String(err) }
+  }
+}
+
 /** The state drawn now; `loading` until the first answer arrives. */
 const state = atom<PanelState>({ kind: 'loading' })
+/** The "Issues abertas" section's state; `issues` empty until the first answer arrives. */
+const issuesState = atom<IssuesState>({ issues: [] })
 /** What the last "Abrir" press answered, inline feedback by report path. */
 const notes = atom<Record<string, { text: string; tone: 'success' | 'danger' }>>({})
 /** One "Preparar e gerar" answer, inline above the list (or the empty state); `null` when none. */
@@ -58,10 +77,20 @@ const taskText = atom('')
 const startNote = atom<{ text: string; tone: 'success' | 'danger' } | null>(null)
 /** Whether an agent dispatch is in flight, so one click cannot start a second. */
 const startBusy = atom(false)
+/** One issue-row 🚀 answer, keyed by the issue it belongs to; `null` when none. */
+const issueNote = atom<{ number: number; text: string; tone: 'success' | 'danger' } | null>(null)
+/** Whether an issue dispatch is in flight, so one click cannot start a second. */
+const issueBusy = atom(false)
 
 /** One list request end to end; `load` turns any failure into the error state. */
 async function refresh(): Promise<void> {
-  set(state, await load(() => plugin.request('list-reports')))
+  // Both lists, in parallel: a failure in one lands as data and never blocks the other.
+  const [reports, issues] = await Promise.all([
+    load(() => plugin.request('list-reports')),
+    loadIssues(() => plugin.request('list-issues'))
+  ])
+  set(state, reports)
+  set(issuesState, issues)
 }
 
 /**
@@ -91,6 +120,18 @@ export async function runStart(req: () => Promise<StartResult>): Promise<StartRe
 }
 
 /**
+ * Pure: one `start-issue` answer, with the request function injected (same shape as
+ * `runStart`). A rejected request becomes `failed` data — the frame never sees an exception.
+ */
+export async function runStartIssue(req: () => Promise<StartResult>): Promise<StartResult> {
+  try {
+    return await req()
+  } catch (err) {
+    return { status: 'failed', detail: String(err) }
+  }
+}
+
+/**
  * The "🚀 Orquestrar tarefa" press: one click that opens the live agent terminal with the
  * alethe kickoff, so the person never has to know that `/alethe` is an agent command rather
  * than a shell one. `started` clears the field (the task now belongs to the terminal); every
@@ -110,6 +151,29 @@ async function start(): Promise<void> {
     if (result.status === 'started') set(taskText, '')
   } finally {
     set(startBusy, false)
+  }
+}
+
+/**
+ * One issue row's "🚀" press: `start-issue` for THAT row, with the same atom discipline as
+ * `start` (busy guard, note reset on the next click). Every outcome lands as an inline note
+ * under the row — never a thrown exception — and the manual field below stays as the fallback.
+ */
+async function startFromIssue(issue: IssueItem): Promise<void> {
+  if (read(issueBusy)) return
+  set(issueBusy, true)
+  set(issueNote, null)
+  try {
+    const result = await runStartIssue(() =>
+      plugin.request('start-issue', { number: issue.number, title: issue.title, url: issue.url })
+    )
+    set(issueNote, {
+      number: issue.number,
+      text: result.detail,
+      tone: result.status === 'started' ? 'success' : 'danger'
+    })
+  } finally {
+    set(issueBusy, false)
   }
 }
 
@@ -194,12 +258,15 @@ function contextOf(path: string): string {
 
 export default function Panel() {
   const current = read(state)
+  const issueList = read(issuesState)
   const allNotes = read(notes)
   const note = read(setupNote)
   const busy = read(setupBusy)
   const task = read(taskText)
   const starting = read(startBusy)
   const dispatchNote = read(startNote)
+  const rowNote = read(issueNote)
+  const issueStarting = read(issueBusy)
   /** The one-click setup button; hidden while loading, drawn where a stale or absent list needs it. Secondary to the dispatch button below. */
   const prepareButton = (size?: 'sm') => (
     <Button
@@ -293,6 +360,49 @@ export default function Panel() {
           {current.kind === 'empty' && dispatchRow}
           {prepareButton()}
           <EmptyState title="Nenhum relatório" description={current.instruction} icon="file-text" />
+        </Stack>
+      )}
+      {/* Issues abertas: a seção existe só com issues; a falha do fetch vira uma nota
+          pequena e não destrutiva na mesma área — o painel segue funcionando. */}
+      {(issueList.issues.length > 0 || issueList.error) && (
+        <Stack gap="sm">
+          {issueList.error && (
+            <Text size="xs" muted>
+              Issues: {issueList.error}
+            </Text>
+          )}
+          {issueList.issues.length > 0 && (
+            <Stack gap="sm">
+              <Heading level={3}>Issues abertas</Heading>
+              {issueList.issues.map((issue) => {
+                const feedback = rowNote?.number === issue.number ? rowNote : null
+                return (
+                  <Row key={issue.number} justify="between" align="start" gap="sm">
+                    <Stack gap="none" align="start">
+                      <Text weight="medium" truncate>
+                        {`#${issue.number} ${issue.title}${
+                          issue.labels.length > 0 ? ` [${issue.labels.join(', ')}]` : ''
+                        }`}
+                      </Text>
+                      {feedback && (
+                        <Text size="xs" tone={feedback.tone}>
+                          {feedback.text}
+                        </Text>
+                      )}
+                    </Stack>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={issueStarting}
+                      onPress={() => startFromIssue(issue)}
+                    >
+                      🚀
+                    </Button>
+                  </Row>
+                )
+              })}
+            </Stack>
+          )}
         </Stack>
       )}
     </Stack>

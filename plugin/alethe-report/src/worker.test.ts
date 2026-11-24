@@ -9,15 +9,19 @@ import {
   folderCommand,
   installCommand,
   isReportPath,
+  issuesCommand,
   judgeTabCreate,
+  listIssues,
   listReports,
   parseFindOutput,
   parseInstallOutput,
+  parseIssuesOutput,
   parseSetupCheck,
   parseSetupFolder,
   parseSetupWrite,
   setupReport,
   shellQuote,
+  startIssue,
   startTask,
   writeCommand,
   type Host
@@ -834,6 +838,301 @@ describe('start-task handler', () => {
     assert.equal(res.status, 'failed')
     assert.match(res.detail, /workspace/)
     assert.ok(tw.logs.some((line) => line.includes('start-task')), 'falha também vai para o log')
+    await tw.deactivate()
+  })
+})
+
+// --- list-issues: as issues abertas do projeto aparecem no painel. ---
+//
+// Um só comando efêmero escolhe o forge pelo remote (glab no GitLab, gh no GitHub),
+// e o parse sobrevive ao eco do comando no PTY (a fonte carrega `[` e `]` do `if [ -z ]`,
+// então "primeiro [ até último ]" cego quebraria: cada candidato a `[` é tentado até
+// JSON.parse aceitar um array).
+
+/** Todos os marcadores completos que `parseIssuesOutput` espera ver, mais o do fluxo. */
+const ISSUE_MARKERS = ['NO_REPO', 'ISSUES_DONE'] as const
+
+describe('issuesCommand', () => {
+  test('fonte não carrega nenhum marcador completo (o eco nunca casa)', () => {
+    const source = issuesCommand()
+    for (const marker of ISSUE_MARKERS) {
+      assert.ok(!source.includes(marker), `${marker} só quebrado com "" na fonte: ${source}`)
+    }
+    assert.ok(source.includes('NO""_REPO'), 'split com aspas vazias, nunca "_"')
+    assert.ok(source.includes('ISSUES""_DONE'), 'split com aspas vazias, nunca "_"')
+    assert.ok(!source.includes('NO"_"REPO'), 'o split antigo com sublinhado não volta')
+    assert.ok(!source.includes('ISSUES"_"DONE'), 'o split antigo com sublinhado não volta')
+  })
+
+  test('escolhe o forge pelo remote: glab no GitLab, gh no GitHub com --limit 20 abertas', () => {
+    const source = issuesCommand()
+    assert.match(source, /git remote get-url origin/)
+    assert.match(source, /grep -qi gitlab/)
+    assert.match(source, /glab issue list -O json/)
+    assert.match(source, /gh issue list --limit 20 --json number,title,url,labels --state open/)
+  })
+
+  test('sem remote → NO_REPO num shell real, e o parse lê o marcador', () => {
+    const out = sh('cd /tmp && ' + issuesCommand())
+    assert.ok(out.includes('NO_REPO'), `saída real: ${JSON.stringify(out)}`)
+    const parsed = parseIssuesOutput(out)
+    assert.deepEqual(parsed.issues, [])
+    assert.match(parsed.error ?? '', /workspace sem remote git/)
+  })
+
+  test('colapsar "" revela exatamente os marcadores esperados', () => {
+    assert.ok(collapsed(issuesCommand()).includes('echo NO_REPO'))
+    assert.ok(collapsed(issuesCommand()).includes('echo ISSUES_DONE'))
+  })
+})
+
+describe('parseIssuesOutput', () => {
+  test('forma do gh: labels [{name}] viram strings', () => {
+    const out =
+      '[{"number":3,"title":"Bug no painel","url":"https://gh/3","labels":[{"name":"bug"},{"name":"ui"}]}]\n' +
+      'ISSUES_DONE'
+    const parsed = parseIssuesOutput(out)
+    assert.equal(parsed.error, undefined)
+    assert.deepEqual(parsed.issues, [
+      { number: 3, title: 'Bug no painel', url: 'https://gh/3', labels: ['bug', 'ui'] }
+    ])
+  })
+
+  test('forma do glab: iid + web_url + labels de string', () => {
+    const out =
+      '[{"iid":7,"title":"Ajuste NDS","web_url":"https://gl/7","labels":["enhancement"]}]\nISSUES_DONE'
+    const parsed = parseIssuesOutput(out)
+    assert.equal(parsed.error, undefined)
+    assert.deepEqual(parsed.issues, [
+      { number: 7, title: 'Ajuste NDS', url: 'https://gl/7', labels: ['enhancement'] }
+    ])
+  })
+
+  test('forma do glab aceita url quando web_url não existe', () => {
+    const parsed = parseIssuesOutput('[{"iid":9,"title":"T","url":"https://gl/9","labels":[]}]\nISSUES_DONE')
+    assert.deepEqual(parsed.issues, [{ number: 9, title: 'T', url: 'https://gl/9', labels: [] }])
+  })
+
+  test('JSON malformado → erro como dado, nunca exceção', () => {
+    const parsed = parseIssuesOutput('[{"number": 1,\nISSUES_DONE')
+    assert.deepEqual(parsed.issues, [])
+    assert.match(parsed.error ?? '', /não consegui ler as issues/)
+  })
+
+  test('sem JSON nenhum (gh/glab ausente) → mesmo erro de leitura', () => {
+    const parsed = parseIssuesOutput('gh: command not found\nISSUES_DONE')
+    assert.deepEqual(parsed.issues, [])
+    assert.match(parsed.error ?? '', /não consegui ler as issues/)
+  })
+
+  test('NO_REPO → workspace sem remote git', () => {
+    const parsed = parseIssuesOutput('echo NO""_REPO\nNO_REPO\nISSUES_DONE')
+    assert.deepEqual(parsed.issues, [])
+    assert.match(parsed.error ?? '', /workspace sem remote git/)
+  })
+
+  test('zero issues → array vazio sem erro', () => {
+    const parsed = parseIssuesOutput('[]\nISSUES_DONE')
+    assert.deepEqual(parsed.issues, [])
+    assert.equal(parsed.error, undefined)
+  })
+
+  test('o eco do comando (com [ e ] do if) não engana o parse', () => {
+    // A fonte real carrega `if [ -z "$url" ]`: um "primeiro [ até último ]" cego
+    // engoliria o eco e o JSON.parse falharia. O parser tem que achar o array REAL.
+    const json = '[{"number":1,"title":"Eco","url":"u","labels":[]}]'
+    const parsed = parseIssuesOutput(`${issuesCommand()}\n${json}\nISSUES_DONE`)
+    assert.equal(parsed.error, undefined, `erro inesperado: ${parsed.error}`)
+    assert.deepEqual(parsed.issues, [{ number: 1, title: 'Eco', url: 'u', labels: [] }])
+  })
+
+  test('corta em 20 issues (máximo do painel)', () => {
+    const many = JSON.stringify(
+      Array.from({ length: 25 }, (_, i) => ({ number: i + 1, title: `t${i}`, url: 'u', labels: [] }))
+    )
+    const parsed = parseIssuesOutput(`${many}\nISSUES_DONE`)
+    assert.equal(parsed.issues.length, 20)
+    assert.equal(parsed.error, undefined)
+  })
+})
+
+describe('listIssues sobre host injetado', () => {
+  test('sequência readContext → create → read → close, com o JSON parseado', async () => {
+    const json = '[{"number":5,"title":"X","url":"https://gl/5","labels":["bug"]}]'
+    const { host, created, closed } = scriptedHost((command) =>
+      command.includes('git remote get-url') ? `${json}\nISSUES_DONE` : ''
+    )
+    const res = await listIssues(host)
+    assert.equal(res.error, undefined)
+    assert.deepEqual(res.issues, [{ number: 5, title: 'X', url: 'https://gl/5', labels: ['bug'] }])
+    assert.equal(created.length, 1, 'um só terminal efêmero')
+    assert.deepEqual(closed, ['t1'], 'fechado no finally, como todo efêmero')
+  })
+
+  test('NO_REPO → erro como dado, com o terminal fechado', async () => {
+    const { host, closed } = scriptedHost(() => 'NO_REPO\nISSUES_DONE')
+    const res = await listIssues(host)
+    assert.deepEqual(res.issues, [])
+    assert.match(res.error ?? '', /workspace sem remote git/)
+    assert.deepEqual(closed, ['t1'])
+  })
+
+  test('host rejeita → erro como dado, nunca exceção', async () => {
+    const host: Host = {
+      call: async () => {
+        throw new Error('boom')
+      }
+    }
+    const res = await listIssues(host)
+    assert.deepEqual(res.issues, [])
+    assert.match(res.error ?? '', /boom/)
+  })
+
+  test('o handler responde a lista e registra falha no log', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', CONTEXT)
+    tw.host.respond('terminal.create', { terminalId: 't1' })
+    tw.host.respond('terminal.read', {
+      lines: ['[{"number":2,"title":"Y","url":"u","labels":[]}]\nISSUES_DONE'],
+      truncated: false
+    })
+    tw.host.respond('terminal.close', { closed: true })
+    const res = await tw.request('list-issues')
+    assert.deepEqual(res.issues, [{ number: 2, title: 'Y', url: 'u', labels: [] }])
+    assert.equal(res.error, undefined)
+    assert.equal(tw.host.callsOf('terminal.close').length, 1)
+    await tw.deactivate()
+  })
+
+  test('falha do handler chega como resposta com error, logada', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', null)
+    const res = await tw.request('list-issues')
+    assert.deepEqual(res.issues, [])
+    assert.ok(res.error, 'erro propagado como resposta')
+    assert.ok(tw.logs.some((line) => line.includes('list-issues')), 'erro também vai para o log')
+    await tw.deactivate()
+  })
+})
+
+// --- start-issue: o 🚀 de uma linha da seção de issues dispara a mesma orquestração. ---
+
+/** O kickoff exato da spec: issue + runbook + dry-run + AGUARDE minha aprovação. */
+function issueKickoffOf(issue: { number: number; title: string; url: string }): string {
+  return (
+    `Use a skill alethe para orquestrar a tarefa da issue #${issue.number}: "${issue.title}" — ${issue.url}. ` +
+    'Leia a issue com gh (ou glab) e siga o runbook NDS em ' +
+    `${RUNBOOK}. ` +
+    'Após analisar, MOSTRE o dry-run (playbook, waves, modelos e estimativa) e ' +
+    'AGUARDE minha aprovação antes de executar qualquer wave.'
+  )
+}
+
+describe('startIssue sobre host injetado', () => {
+  test('sem number ou title → failed "Escolha uma issue primeiro." antes de qualquer host call', async () => {
+    const { host, created } = startHost('INSTALLED')
+    const invalid = [
+      { number: 0, title: 'x', url: 'u' },
+      { number: NaN, title: 'x', url: 'u' },
+      { number: 3, title: '   ', url: 'u' },
+      { number: 3, title: '', url: 'u' }
+    ]
+    for (const issue of invalid) {
+      const res = await startIssue(host, issue)
+      assert.equal(res.status, 'failed')
+      assert.equal(res.detail, 'Escolha uma issue primeiro.')
+    }
+    assert.deepEqual(created, [], 'nenhum terminal criado na validação')
+  })
+
+  test('dispatch → create do agente com issue #, título, url e AGUARDE; nunca fechado', async () => {
+    const issue = {
+      number: 42,
+      title: 'Corrigir o write-back dual-forge',
+      url: 'https://gitlab.com/grp/proj/-/issues/42'
+    }
+    const { host, created, closed } = startHost('INSTALLED')
+    const res = await startIssue(host, issue)
+    assert.equal(res.status, 'started')
+    const agent = created.find((record) => record.command.includes('opencode run'))
+    assert.ok(agent, 'terminal do agente criado')
+    assert.ok(agent.command.includes('#42'), 'o número da issue vai no kickoff')
+    assert.ok(agent.command.includes(issue.title), 'o título vai no kickoff')
+    assert.ok(agent.command.includes(issue.url), 'a url vai no kickoff')
+    assert.ok(agent.command.includes('AGUARDE minha aprovação'), 'o dry-run e a aprovação vão no kickoff')
+    assert.ok(agent.command.includes(RUNBOOK), 'o runbook NDS vai no comando')
+    assert.equal(
+      agent.command,
+      `opencode run ${shellQuote(issueKickoffOf(issue))}`,
+      'o kickoff inteiro passa pelo shellQuote'
+    )
+    assert.ok(agent.title.startsWith('alethe #42 '), 'título nomeia a issue')
+    assert.deepEqual(
+      closed.filter((terminalId) => terminalId === agent.terminalId),
+      [],
+      'o terminal do agente NUNCA é fechado'
+    )
+    assert.equal(closed.length, 1, 'só o terminal efêmero do check é fechado')
+  })
+
+  test('título longo corta em 30 caracteres no título do terminal', async () => {
+    const issue = { number: 7, title: 'Um título bem comprido que passa de trinta caracteres', url: 'u' }
+    const { host, created } = startHost('INSTALLED')
+    await startIssue(host, issue)
+    const agent = created.find((record) => record.command.includes('opencode run'))
+    assert.ok(agent)
+    assert.equal(agent.title, `alethe #7 ${issue.title.slice(0, 30)}`)
+  })
+})
+
+describe('start-issue handler', () => {
+  test('input inválido → failed sem nenhuma chamada ao host', async () => {
+    const tw = await mountWorker(main)
+    const res = await tw.request('start-issue', { number: 0, title: '', url: '' })
+    assert.equal(res.status, 'failed')
+    assert.equal(res.detail, 'Escolha uma issue primeiro.')
+    assert.deepEqual(tw.host.calls, [], 'nenhuma chamada ao host antes de validar')
+    await tw.deactivate()
+  })
+
+  test('dispatch completo pela host: check → agente, sem close do agente', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', CONTEXT)
+    tw.host.respond('terminal.create', (params: { command?: string }) => ({
+      terminalId: String(params.command ?? '').includes('opencode run') ? 'agent' : 'check'
+    }))
+    tw.host.respond('terminal.read', { lines: ['INSTALLED'], truncated: false })
+    tw.host.respond('terminal.close', { closed: true })
+    const res = await tw.request('start-issue', {
+      number: 9,
+      title: 'Fechar o plano',
+      url: 'https://gh/9'
+    })
+    assert.equal(res.status, 'started')
+    const commands = (tw.host.callsOf('terminal.create') as Array<{ command: string }>).map(
+      (record) => record.command
+    )
+    assert.ok(
+      commands.some((command) => command.includes('#9') && command.includes('https://gh/9')),
+      'kickoff com número e url'
+    )
+    const closes = tw.host.callsOf('terminal.close') as Array<{ terminalId: string }>
+    assert.deepEqual(
+      closes.filter((close) => close.terminalId === 'agent'),
+      [],
+      'o terminal do agente sobrevive'
+    )
+    assert.equal(closes.length, 1, 'apenas o check efêmero foi fechado')
+    await tw.deactivate()
+  })
+
+  test('falha chega como resposta (logada), nunca como exceção', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', null)
+    const res = await tw.request('start-issue', { number: 1, title: 'x', url: 'u' })
+    assert.equal(res.status, 'failed')
+    assert.match(res.detail, /workspace/)
+    assert.ok(tw.logs.some((line) => line.includes('start-issue')), 'falha também vai para o log')
     await tw.deactivate()
   })
 })

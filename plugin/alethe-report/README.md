@@ -7,6 +7,8 @@ orca plugin dev request . list-reports
 orca plugin dev request . open-report --data '{"path":"/home/you/.config/alethe/orchestrations/2026-11-24-1/wave-2/report.html"}'
 orca plugin dev request . setup-report
 orca plugin dev request . start-task --data '{"task":"escrever o plano de testes"}'
+orca plugin dev request . list-issues
+orca plugin dev request . start-issue --data '{"number":42,"title":"Corrigir o write-back dual-forge","url":"https://gitlab.com/grp/proj/-/issues/42"}'
 ```
 
 ## `/alethe` não é comando de shell
@@ -20,6 +22,12 @@ opencode run 'Use a skill alethe para orquestrar a tarefa seguindo o runbook NDS
 ```
 
 Esse terminal **não** é fechado: é a sessão viva que você acompanha enquanto as waves rodam (todos os outros terminais do worker são efêmeros e fechados num `finally`), e o relatório aparece no painel quando elas concluírem. A tarefa inteira passa pelo `shellQuote`, então `"`, `$()` e backticks dentro do texto viram dados, nunca sintaxe de shell. Falhas voltam como nota inline no painel (campo vazio, clone recusado, nenhum workspace focado) — nunca como exceção no frame.
+
+## Issues abertas no painel
+
+As issues do projeto aparecem no painel: o worker `list-issues` abre **um** terminal efêmero que escolhe o forge pelo remote do repositório (`glab issue list -O json` no GitLab, `gh issue list --limit 20 … --state open` no GitHub), lê o JSON das duas formas e devolve no máximo 20 issues abertas (`#<n> <título> [labels]`). Sem remote o painel diz `workspace sem remote git`; sem `gh`/`glab` ou com JSON ilegível, uma nota pequena e não destrutiva na área da seção — a lista de relatórios segue funcionando.
+
+O 🚀 de cada linha dispara `start-issue`, que roda o **mesmo** dispatcher do campo de tarefa (`dispatchAgent`, terminal de agente nunca fechado) com o kickoff da issue: número, título e url, o runbook NDS e a instrução de **mostrar o dry-run (playbook, waves, modelos e estimativa) e aguardar sua aprovação antes de executar qualquer wave** — o alethe propõe as ondas e você aprova no terminal. O campo **Qual tarefa?** continua ali como fallback.
 
 ## Decisão de abertura (Task 4, 2026-11-24)
 

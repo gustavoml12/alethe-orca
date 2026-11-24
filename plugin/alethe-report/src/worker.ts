@@ -7,11 +7,14 @@
 import type { OrcaWorkerApi } from 'orca/worker'
 import {
   isReportPath,
+  listIssues,
   listReports,
   openReport,
   setupReport,
+  startIssue,
   startTask,
   type Host,
+  type IssueList,
   type OpenResult,
   type ReportList,
   type SetupResult,
@@ -56,6 +59,27 @@ export default function activate(orca: OrcaWorkerApi): void {
     const task = String(input?.task ?? '')
     const result = await startTask(host, task)
     if (result.status === 'failed') orca.log(`start-task: ${result.detail}`)
+    return result
+  })
+
+  // The panel's "Issues abertas" section: one ephemeral terminal picks gh or glab by the git
+  // remote and lists the open issues; failures arrive as `error` data, logged for the note.
+  orca.panels.handle('list-issues', async (): Promise<IssueList> => {
+    const result = await listIssues(host)
+    if (result.error) orca.log(`list-issues: ${result.error}`)
+    return result
+  })
+
+  // One row's 🚀: same shared dispatcher as `start-task` (never closes the agent terminal),
+  // with the issue's kickoff asking for the dry-run and holding for approval.
+  orca.panels.handle('start-issue', async (input): Promise<StartResult> => {
+    const issue = {
+      number: Number(input?.number ?? 0),
+      title: String(input?.title ?? ''),
+      url: String(input?.url ?? '')
+    }
+    const result = await startIssue(host, issue)
+    if (result.status === 'failed') orca.log(`start-issue: ${result.detail}`)
     return result
   })
 }

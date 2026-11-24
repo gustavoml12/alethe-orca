@@ -37,6 +37,12 @@ export type StartResult = {
   detail: string
 }
 
+/** One open issue of the project, as the panel draws it. */
+export type IssueItem = { number: number; title: string; url: string; labels: string[] }
+
+/** `list-issues`' answer: the open issues (at most 20), or why there are none. */
+export type IssueList = { issues: IssueItem[]; error?: string }
+
 /** Where Alethe's orchestrations (and each wave's report.html) live. */
 const ORCHESTRATIONS = '~/.config/alethe/orchestrations'
 
@@ -298,7 +304,7 @@ const INSTALL_FAILED_DETAIL =
 const CHECK_FAILED_DETAIL = 'Não foi possível verificar se o alethe está instalado.'
 
 /** Bounded polls per step: a local `test` answers at once, a clone and a render take longer. */
-const STEP_DEADLINES = { check: 15_000, install: 120_000, folder: 15_000, write: 180_000 }
+const STEP_DEADLINES = { check: 15_000, install: 120_000, folder: 15_000, write: 180_000, issues: 30_000 }
 
 /**
  * Runs one step's command in its own ephemeral terminal and returns its output, polling until
@@ -427,6 +433,105 @@ export async function setupReport(host: Host): Promise<SetupResult> {
   }
 }
 
+// --- list-issues: as issues abertas do projeto, de qualquer forge. ---
+//
+// Um só comando efêmero decide o CLI pelo remote do repositório: glab no GitLab,
+// gh no GitHub. Os marcadores seguem a mesma disciplina do setup — quebrados com
+// aspas vazias (`NO""_REPO`), nunca `"_"`, e nenhum marcador completo na fonte,
+// para o eco do comando no PTY não casar com o resultado.
+
+/** One ephemeral command: the remote picks the forge, then the list, then the marker. */
+export function issuesCommand(): string {
+  return (
+    'url=$(git remote get-url origin 2>/dev/null); ' +
+    'if [ -z "$url" ]; then echo NO""_REPO; ' +
+    'elif echo "$url" | grep -qi gitlab; then glab issue list -O json; ' +
+    'else gh issue list --limit 20 --json number,title,url,labels --state open; fi; ' +
+    'echo ISSUES""_DONE'
+  )
+}
+
+/** The panel's cap: `list-issues` answers with at most 20 open issues. */
+const MAX_ISSUES = 20
+
+/**
+ * Normalizes ONE issue of either forge's shape: gh's `{number, url, labels:[{name}]}` and
+ * glab's `{iid, web_url|url, labels:[string]}`. Anything without a usable number is dropped
+ * (a row the panel could not label `#<n>` is not an issue to show).
+ */
+export function normalizeIssue(raw: unknown): IssueItem | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const record = raw as Record<string, unknown>
+  const rawNumber = record.number ?? record.iid
+  const number = typeof rawNumber === 'number' ? rawNumber : Number(rawNumber)
+  if (!Number.isFinite(number)) return undefined
+  const rawLabels = Array.isArray(record.labels) ? record.labels : []
+  const labels = rawLabels
+    .map((label) =>
+      typeof label === 'string' ? label : typeof (label as { name?: unknown })?.name === 'string'
+        ? String((label as { name: string }).name)
+        : ''
+    )
+    .filter((label) => label !== '')
+  return {
+    number,
+    title: String(record.title ?? ''),
+    url: String(record.web_url ?? record.url ?? ''),
+    labels
+  }
+}
+
+/**
+ * Reads `issuesCommand`'s output: `NO_REPO` → no remote; otherwise the JSON array
+ * between the markers. The terminal ECHOES the command (whose source carries `[` and `]`
+ * from `if [ -z "$url" ]`), so "first `[` to last `]`" over the raw text would swallow the
+ * echo and fail — instead every `[` position is tried as a start until `JSON.parse`
+ * accepts an array. A failure is data (`error`), never a throw.
+ */
+export function parseIssuesOutput(output: string): IssueList {
+  if (lastMarker(output, ['NO_REPO']) !== undefined) {
+    return { issues: [], error: 'workspace sem remote git' }
+  }
+  const end = output.lastIndexOf(']')
+  if (end !== -1) {
+    for (let at = output.indexOf('['); at !== -1 && at < end; at = output.indexOf('[', at + 1)) {
+      try {
+        const parsed: unknown = JSON.parse(output.slice(at, end + 1))
+        if (Array.isArray(parsed)) {
+          const issues = parsed
+            .map(normalizeIssue)
+            .filter((issue): issue is IssueItem => issue !== undefined)
+            .slice(0, MAX_ISSUES)
+          return { issues }
+        }
+      } catch {
+        /* este `[` não abre o array real; tenta o próximo */
+      }
+    }
+  }
+  return { issues: [], error: 'não consegui ler as issues (gh/glab ausente?)' }
+}
+
+/**
+ * Lists the project's open issues in ONE ephemeral terminal (closed in `runStep`'s
+ * `finally`), parsing the forge's JSON. Every failure — no workspace, a refused create,
+ * gh/glab missing — comes back as an `IssueList` with `error`, never thrown.
+ */
+export async function listIssues(host: Host): Promise<IssueList> {
+  try {
+    const output = await runStep(
+      host,
+      'alethe-report: issues',
+      issuesCommand(),
+      ['ISSUES_DONE'],
+      STEP_DEADLINES.issues
+    )
+    return parseIssuesOutput(output)
+  } catch (err) {
+    return { issues: [], error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 // --- start-task: the first step without friction — the panel dispatches the agent itself. ---
 
 /** The kickoff one task runs: the alethe skill, the NDS runbook and the task, in one line. */
@@ -438,22 +543,32 @@ function kickoffOf(task: string): string {
   )
 }
 
+/** The kickoff one ISSUE runs: the issue (number, title, url), the runbook, the dry-run gate. */
+function issueKickoffOf(issue: { number: number; title: string; url: string }): string {
+  return (
+    `Use a skill alethe para orquestrar a tarefa da issue #${issue.number}: "${issue.title}" — ${issue.url}. ` +
+    'Leia a issue com gh (ou glab) e siga o runbook NDS em ' +
+    '~/.agents/skills/alethe/references/nds-runbook.md. ' +
+    'Após analisar, MOSTRE o dry-run (playbook, waves, modelos e estimativa) e ' +
+    'AGUARDE minha aprovação antes de executar qualquer wave.'
+  )
+}
+
 /**
- * Dispatches the alethe agent for one task: ensure the skill, read the workspace and open the
- * AGENT terminal carrying the kickoff. Unlike every other terminal in this file this one is NOT
- * ephemeral and is never closed — it is the live session the user watches while the waves run,
- * so closing it would kill the orchestration it just started (runStep's `finally` is exactly
- * the anti-pattern this function must not inherit; that is why there is no `finally` here at
- * all). The kickoff goes through `shellQuote`, so a task with `"`, `$()` or backticks stays
- * data and never becomes shell syntax. Every failure — an empty task, an unreadable check, a
- * refused clone, no workspace, a refused create — comes back as a `StartResult`, never thrown.
+ * The shared dispatcher behind `start-task` and `start-issue`: ensure the skill, read the
+ * workspace and open the AGENT terminal carrying `kickoff` under `title`. Unlike every other
+ * terminal in this file this one is NOT ephemeral and is never closed — it is the live session
+ * the user watches while the waves run, so closing it would kill the orchestration it just
+ * started (runStep's `finally` is exactly the anti-pattern this function must not inherit;
+ * that is why there is no `finally` here at all). The kickoff goes through `shellQuote`, so
+ * `"`, `$()` or backticks stay data and never become shell syntax. Every failure comes back
+ * as a `StartResult`, never thrown.
  */
-export async function startTask(host: Host, task: string): Promise<StartResult> {
-  const trimmed = task.trim()
-  if (trimmed === '') {
-    // Before ANY host call: an empty field must not reach a terminal at all.
-    return { status: 'failed', detail: 'Escreva a tarefa antes de orquestrar.' }
-  }
+export async function dispatchAgent(
+  host: Host,
+  kickoff: string,
+  title: string
+): Promise<StartResult> {
   try {
     const ensured = await ensureAlethe(host)
     if (!ensured.ok) return { status: 'failed', detail: ensured.detail }
@@ -462,8 +577,8 @@ export async function startTask(host: Host, task: string): Promise<StartResult> 
     if (!workspaceId) return { status: 'failed', detail: 'nenhum workspace focado' }
     await host.call('terminal.create', {
       workspaceId,
-      title: `alethe: ${trimmed.slice(0, 40)}`,
-      command: `opencode run ${shellQuote(kickoffOf(trimmed))}`
+      title,
+      command: `opencode run ${shellQuote(kickoff)}`
     })
     return {
       status: 'started',
@@ -475,4 +590,35 @@ export async function startTask(host: Host, task: string): Promise<StartResult> 
     // verbatim instead of wearing an `Error: ` prefix.
     return { status: 'failed', detail: err instanceof Error ? err.message : String(err) }
   }
+}
+
+/**
+ * Dispatches the alethe agent for one task: validate the field, then the shared
+ * `dispatchAgent` (ensure → workspace → agent terminal with the task's kickoff).
+ */
+export async function startTask(host: Host, task: string): Promise<StartResult> {
+  const trimmed = task.trim()
+  if (trimmed === '') {
+    // Before ANY host call: an empty field must not reach a terminal at all.
+    return { status: 'failed', detail: 'Escreva a tarefa antes de orquestrar.' }
+  }
+  return dispatchAgent(host, kickoffOf(trimmed), `alethe: ${trimmed.slice(0, 40)}`)
+}
+
+/**
+ * Dispatches the alethe agent for one ISSUE (the panel's "Issues abertas" 🚀): validate the
+ * row, then the same `dispatchAgent` as `start-task` — no duplicated command strings. The
+ * kickoff asks for the dry-run and holds for approval, the flow the user chose: alethe
+ * previews the waves and "goal alone is not approval". The agent terminal is NEVER closed.
+ */
+export async function startIssue(
+  host: Host,
+  issue: { number: number; title: string; url: string }
+): Promise<StartResult> {
+  if (!Number.isFinite(issue?.number) || issue.number <= 0 || String(issue.title ?? '').trim() === '') {
+    // Before ANY host call: a missing row must not reach a terminal at all.
+    return { status: 'failed', detail: 'Escolha uma issue primeiro.' }
+  }
+  const title = `alethe #${issue.number} ${issue.title.slice(0, 30)}`
+  return dispatchAgent(host, issueKickoffOf(issue), title)
 }
