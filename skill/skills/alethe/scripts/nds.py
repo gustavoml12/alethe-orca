@@ -1,8 +1,9 @@
-"""NDS fork helpers: human gate and GitLab write-back for alethe-orchestrate.
+"""NDS fork helpers: human gate and dual-forge write-back for alethe-orchestrate.
 
 Stdlib only. The gate is a small JSON state machine in the orchestration folder;
 approval comes from this terminal's stdin or from `orchestrate.py gate approve`
 in another terminal. Never raises into the runner: write-back is best effort.
+Comments go to GitHub (`gh`) or GitLab (`glab`) per the resolved forge.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ CONFIG_FILE = "nds.json"
 ATTEMPTS_FILE = "spec_attempts.json"
 GATE_ENV_HOURS = "NDS_GATE_HOURS"
 ISSUE_ENV = "NDS_ISSUE"
+FORGE_ENV = "NDS_FORGE"
 APPROVE_WORDS = {"sim", "s", "yes", "y", "approve", "aprovado", "aprovada", "ok"}
 REJECT_WORDS = {"nao", "não", "no", "n", "reject", "reprovado", "reprovada"}
 
@@ -248,9 +250,37 @@ def _append_pending(folder: Path, event: str, body: str) -> None:
         handle.write(f"\n## {event} — {_now()}\n\n{body}\n")
 
 
+def resolve_forge(config: Dict[str, Any]) -> str:
+    """Env `NDS_FORGE` > nds.json `"forge"` > default `"gitlab"` (comportamento antigo).
+
+    Um valor desconhecido em qualquer fonte é ignorado e a próxima candidata
+    decide; sem nenhuma válida, o default gitlab preserva o fork antigo.
+    """
+    for candidate in (os.environ.get(FORGE_ENV, ""), config.get("forge", "")):
+        value = str(candidate or "").strip().lower()
+        if value in ("github", "gitlab"):
+            return value
+    return "gitlab"
+
+
+def _comment_cmd(forge: str, issue: str, body: str, repo: str) -> list:
+    """O argv de comentário do forge: gh no GitHub, glab no GitLab.
+
+    `--repo` viaja só quando o config tem `repo` — nos dois forges (o gh aceita
+    `--repo <owner>/<repo>`; o glab já recebia assim, inalterado).
+    """
+    if forge == "github":
+        cmd = ["gh", "issue", "comment", issue, "--body", body]
+    else:
+        cmd = ["glab", "issue", "note", issue, "-m", body]
+    if repo:
+        cmd += ["--repo", repo]
+    return cmd
+
+
 def notify(folder: Path, event: str, report: Optional[Dict[str, Any]] = None,
            text: str = "") -> int:
-    """Best-effort GitLab comment; never raises, never fails the pipeline."""
+    """Best-effort comment on the resolved forge; never raises, never fails the pipeline."""
     try:
         if not folder.is_dir():
             return 0
@@ -260,14 +290,12 @@ def notify(folder: Path, event: str, report: Optional[Dict[str, Any]] = None,
         if not issue:
             _append_pending(folder, event, body)
             return 0
-        cmd = ["glab", "issue", "note", issue, "-m", body]
         repo = str(config.get("repo") or "").strip()
-        if repo:
-            cmd += ["--repo", repo]
+        cmd = _comment_cmd(resolve_forge(config), issue, body, repo)
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         except (OSError, subprocess.SubprocessError):
-            # glab ausente/quebrado/estourou timeout: preserva o comentário
+            # gh/glab ausente/quebrado/estourou timeout: preserva o comentário
             # COMPLETO (tabela inclusive) localmente — só surpresas inesperadas
             # caem no fallback de marcação única lá embaixo.
             _append_pending(folder, event, body)
