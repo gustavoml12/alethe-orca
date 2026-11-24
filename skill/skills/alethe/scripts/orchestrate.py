@@ -25,6 +25,15 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+# NDS fork: gate humano + write-back GitLab (see FORK-DELTA.md)
+_scripts_dir = str(Path(__file__).resolve().parent)
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+try:
+    import nds  # type: ignore
+except ImportError:  # pragma: no cover - upstream copy without the NDS delta
+    nds = None
+
 
 PLAN_VERSION = 1
 STATE_VERSION = 1
@@ -6352,6 +6361,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run_parser.add_argument(
         "--allow-low-quota", action="store_true", help="start workers past quota.stopAt; only after the user agrees"
     )
+    run_parser.add_argument(
+        "--gate-before", metavar="LABEL",
+        help="NDS: pause for human approval before starting this wave's workers",
+    )
+    gate_parser = subparsers.add_parser("gate", help="NDS: inspect, approve or reject a human gate")
+    gate_parser.add_argument("action", choices=["status", "approve", "reject"])
+    gate_parser.add_argument("--in", dest="into", metavar="FOLDER", default="current")
+    gate_parser.add_argument("--label", default=None)
     report_parser = subparsers.add_parser(
         "report", help="explain what runs did, why, and what they reported spending"
     )
@@ -6644,14 +6661,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
             )
             return 0
+        if args.command == "gate":
+            if nds is None:
+                raise PlanError("NDS fork helpers are not installed (nds.py missing)")
+            folder = resolve_folder(None if args.into == "current" else Path(args.into))
+            try:
+                if args.action == "status":
+                    print(json.dumps(nds.gate_status(folder, args.label), ensure_ascii=False))
+                elif args.action == "approve":
+                    print(json.dumps(nds.gate_approve(folder, args.label), ensure_ascii=False))
+                else:
+                    print(json.dumps(nds.gate_reject(folder, args.label), ensure_ascii=False))
+            except nds.GateError as error:
+                print(f"error: {error}", file=sys.stderr)
+                return 2
+            return 0
         policy_path = (args.policy or default_policy_path()).expanduser().resolve()
         run_dir = args.run_dir
+        folder: Optional[Path] = None
         if args.into:
             if run_dir is not None:
                 raise PlanError("pass --run-dir or --in, not both")
             raw = read_json(args.plan)
             folder = resolve_folder(None if args.into == "current" else Path(args.into))
             run_dir = next_wave_dir(folder, raw.get("phase") if isinstance(raw, dict) else None)
+        if args.gate_before:
+            if nds is None:
+                raise PlanError("NDS fork helpers are not installed (nds.py missing)")
+            if not args.into:
+                raise PlanError("--gate-before requires --in (an orchestration folder); "
+                                "a bare run has nowhere to keep the gate state")
+            gate_rc = nds.gate_wait(folder, args.gate_before)
+            if gate_rc != 0:
+                return gate_rc
         if args.detach:
             print(json.dumps(detach_run(args.plan, run_dir, policy_path, args.strategy, args.allow_low_quota)))
             return 0

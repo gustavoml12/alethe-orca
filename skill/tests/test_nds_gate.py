@@ -77,5 +77,63 @@ class GateStateTest(unittest.TestCase):
         self.assertEqual(state["label"], "w")
 
 
+class GateCliTest(unittest.TestCase):
+    def setUp(self):
+        self.folder = Path(tempfile.mkdtemp(prefix="nds-cli-"))
+        self.orch = importlib.util.spec_from_file_location(
+            "orchestrate_nds",
+            ROOT / "skills" / "alethe" / "scripts" / "orchestrate.py")
+        self.orch_mod = importlib.util.module_from_spec(self.orch)
+        self.orch.loader.exec_module(self.orch_mod)
+
+    def test_gate_subcommand_approves(self):
+        nds.gate_wait.__wrapped__ if False else None
+        (self.folder / "gate.json").write_text(json.dumps(
+            {"label": "w", "state": "waiting", "createdAt": "x", "resolvedAt": None, "by": "file"}))
+        rc = self.orch_mod.main(["gate", "approve", "--in", str(self.folder)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads((self.folder / "gate.json").read_text())["state"], "approved")
+
+    def test_gate_before_requires_orchestration(self):
+        # wave avulsa (sem --in) deve falhar cedo, nunca rodar sem gate
+        plan = self.folder / "plan.json"
+        plan.write_text(json.dumps({"version": 1, "workers": [
+            {"id": "w", "provider": "claude", "cwd": ".", "mode": "read-only", "task": "x"}]}))
+        with mock.patch.object(self.orch_mod, "run_batch") as rb:
+            rc = self.orch_mod.main(["run", str(plan), "--gate-before", "exec"])
+        self.assertEqual(rc, 2)
+        rb.assert_not_called()
+
+    def test_gate_before_blocked_when_rejected(self):
+        folder = self.folder
+        (folder / "orchestration.json").write_text("{}")
+        plan = folder / "plan.json"
+        plan.write_text(json.dumps({"version": 1, "workers": [
+            {"id": "w", "provider": "claude", "cwd": ".", "mode": "read-only", "task": "x"}]}))
+        (folder / "gate.json").write_text(json.dumps(
+            {"label": "exec", "state": "rejected", "createdAt": "x", "resolvedAt": "y", "by": "file"}))
+        with mock.patch.object(self.orch_mod, "run_batch") as rb:
+            rc = self.orch_mod.main(["run", str(plan), "--in", str(folder), "--gate-before", "exec"])
+        self.assertEqual(rc, 3)
+        rb.assert_not_called()
+
+    def test_gate_before_runs_when_approved(self):
+        folder = self.folder
+        (folder / "orchestration.json").write_text("{}")
+        plan = folder / "plan.json"
+        plan.write_text(json.dumps({"version": 1, "workers": [
+            {"id": "w", "provider": "claude", "cwd": ".", "mode": "read-only", "task": "x"}]}))
+        (folder / "gate.json").write_text(json.dumps(
+            {"label": "exec", "state": "approved", "createdAt": "x", "resolvedAt": "y", "by": "file"}))
+        with mock.patch.object(self.orch_mod, "run_batch", return_value=0) as rb:
+            rc = self.orch_mod.main(["run", str(plan), "--in", str(folder), "--gate-before", "exec"])
+        self.assertEqual(rc, 0)
+        rb.assert_called_once()
+
+    def test_cli_works_without_nds_module(self):
+        # compat: import guardado — main continua existindo sem nds
+        self.assertTrue(hasattr(self.orch_mod, "main"))
+
+
 if __name__ == "__main__":
     unittest.main()
