@@ -150,16 +150,24 @@ def gate_wait(folder: Path, label: str, timeout_hours: float = 24.0,
         return 3
     _write_gate(folder, "waiting", label, "terminal")
     _prompt(label, folder)
+    notify(folder, "gate-waiting", None,
+           text=f"Wave `{label}` pausada; aguardando aprovação humana "
+                f"(libere com `orchestrate.py gate approve --in \"{folder}\"`).")
     threading.Thread(target=_stdin_watcher, args=(folder, label), daemon=True).start()
     deadline = time.monotonic() + (timeout_hours * 3600)
     while True:
         state = _read_gate(folder) or {}
         if state.get("state") == "approved":
+            notify(folder, "gate-approved", None, text=f"Wave `{label}` liberada.")
             return 0
         if state.get("state") == "rejected":
+            notify(folder, "gate-rejected", None,
+                   text=f"Wave `{label}` abortada: recusada pelo usuário.")
             return 3
         if time.monotonic() > deadline:
             _write_gate(folder, "expired", label, "timeout")
+            notify(folder, "gate-rejected", None,
+                   text=f"Wave `{label}` abortada: gate expirou após {timeout_hours:g}h sem resposta.")
             print("NDS GATE: expirou sem resposta; abortando a wave.", flush=True)
             return 3
         if poll_seconds > 0:

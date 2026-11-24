@@ -86,6 +86,58 @@ class NotifyTest(unittest.TestCase):
         self.assertIn("wave-done", pending.read_text())
 
 
+class GateNotifyTest(unittest.TestCase):
+    def setUp(self):
+        self.folder = Path(tempfile.mkdtemp(prefix="nds-gaten-"))
+
+    def test_gate_wait_publishes_waiting_then_approved(self):
+        with mock.patch.object(nds, "notify", return_value=0) as notify:
+            with mock.patch.object(nds, "_read_gate", side_effect=[
+                None,  # inicial
+                {"label": "e", "state": "approved"},  # poll 1 -> resolve
+            ]):
+                rc = nds.gate_wait(self.folder, "e", timeout_hours=1, poll_seconds=0)
+        self.assertEqual(rc, 0)
+        events = [c[0][1] for c in notify.call_args_list]
+        self.assertIn("gate-waiting", events)
+        self.assertIn("gate-approved", events)
+
+    def test_gate_rejected_publishes_rejected(self):
+        with mock.patch.object(nds, "notify", return_value=0) as notify:
+            with mock.patch.object(nds, "_read_gate", side_effect=[
+                None,
+                {"label": "e", "state": "rejected"},
+            ]):
+                rc = nds.gate_wait(self.folder, "e", timeout_hours=1, poll_seconds=0)
+        self.assertEqual(rc, 3)
+        events = [c[0][1] for c in notify.call_args_list]
+        self.assertIn("gate-rejected", events)
+
+
+class WaveDoneNotifyTest(unittest.TestCase):
+    def setUp(self):
+        self.folder = Path(tempfile.mkdtemp(prefix="nds-wavedone-"))
+        (self.folder / "orchestration.json").write_text("{}")
+        self.plan = self.folder / "plan.json"
+        self.plan.write_text(json.dumps({"version": 1, "workers": [
+            {"id": "w", "provider": "claude", "cwd": ".", "mode": "read-only", "task": "x"}]}))
+        orch_spec = importlib.util.spec_from_file_location(
+            "orchestrate_wavedone",
+            ROOT / "skills" / "alethe" / "scripts" / "orchestrate.py")
+        self.orch = importlib.util.module_from_spec(orch_spec)
+        orch_spec.loader.exec_module(self.orch)
+
+    def test_run_publishes_wave_done_with_exit_code(self):
+        with mock.patch.object(self.orch, "run_batch", return_value=7), \
+             mock.patch.object(self.orch.nds, "notify", return_value=0) as notify:
+            rc = self.orch.main(["run", str(self.plan), "--in", str(self.folder)])
+        self.assertEqual(rc, 7)  # exit original preservado
+        notify.assert_called_once()
+        call = notify.call_args
+        self.assertEqual(call.args[1], "wave-done")
+        self.assertIn("exit 7", call.kwargs.get("text", ""))
+
+
 class NdsEventCliTest(unittest.TestCase):
     def setUp(self):
         self.folder = Path(tempfile.mkdtemp(prefix="nds-event-"))

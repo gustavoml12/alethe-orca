@@ -6722,7 +6722,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         if args._background and sys.stdin.buffer.read(1) != b"1":
             raise PlanError("detached launcher exited before preparing the run")
-        return run_batch(args.plan, run_dir, policy_path, args.strategy, args._background, args.allow_low_quota)
+        rc = run_batch(args.plan, run_dir, policy_path, args.strategy, args._background, args.allow_low_quota)
+        if nds is not None and args.into and not args._background:
+            folder = resolve_folder(None if args.into == "current" else Path(args.into))
+            report = None
+            try:
+                report = build_report([run_dir] if run_dir else [], folder)
+            except Exception:
+                report = None
+            nds.notify(folder, "wave-done", report,
+                       text=f"Wave terminou com exit {rc}.")
+        return rc
     except PlanError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
