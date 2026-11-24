@@ -486,6 +486,15 @@ export function normalizeIssue(raw: unknown): IssueItem | undefined {
   }
 }
 
+/** Normalizes + caps a parsed array into the panel's answer. */
+function toIssueList(parsed: unknown[]): IssueList {
+  const issues = parsed
+    .map(normalizeIssue)
+    .filter((issue): issue is IssueItem => issue !== undefined)
+    .slice(0, MAX_ISSUES)
+  return { issues }
+}
+
 /**
  * Reads `issuesCommand`'s output: `NO_REPO` → no remote; otherwise the JSON array
  * between the markers. The terminal ECHOES the command (whose source carries `[` and `]`
@@ -502,15 +511,20 @@ export function parseIssuesOutput(output: string): IssueList {
     for (let at = output.indexOf('['); at !== -1 && at < end; at = output.indexOf('[', at + 1)) {
       try {
         const parsed: unknown = JSON.parse(output.slice(at, end + 1))
-        if (Array.isArray(parsed)) {
-          const issues = parsed
-            .map(normalizeIssue)
-            .filter((issue): issue is IssueItem => issue !== undefined)
-            .slice(0, MAX_ISSUES)
-          return { issues }
-        }
+        if (Array.isArray(parsed)) return toIssueList(parsed)
       } catch {
         /* este `[` não abre o array real; tenta o próximo */
+      }
+    }
+    // A retenção do terminal cortou a CABEÇA do array (o `[` inicial já não existe):
+    // cada `{` vira candidato a primeiro objeto — `[{…resto…}]` reconstitui o array
+    // com todas as issues 100% completas após o corte (a cortada é perdida, nunca inventada).
+    for (let at = output.indexOf('{'); at !== -1 && at < end; at = output.indexOf('{', at + 1)) {
+      try {
+        const parsed: unknown = JSON.parse(`[${output.slice(at, end + 1)}`)
+        if (Array.isArray(parsed)) return toIssueList(parsed)
+      } catch {
+        /* este `{` não abre um objeto completo; tenta o próximo */
       }
     }
   }

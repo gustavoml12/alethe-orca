@@ -992,6 +992,38 @@ describe('parseIssuesOutput', () => {
     assert.deepEqual(parsed.issues, [{ number: 1, title: 'Eco', url: 'u', labels: [] }])
   })
 
+  // SEGUNDO modo de falha observado ao vivo (após o tr -d '\n'): o terminal do Orca
+  // descarta o MAIS ANTIGO quando a saída total passa de ~7.5KB, e o corte cai DENTRO
+  // do JSON de uma linha só — sobra `…título…","url":…}]` sem o `[` inicial.
+  // A recobra tenta cada `{` como início de objeto até JSON.parse aceitar um array.
+  test('cabeça cortada pela retenção do terminal → recupera as issues completas', () => {
+    const issues = Array.from({ length: 20 }, (_, i) => ({
+      number: 100 - i,
+      title: `Issue ${i} com um título razoavelmente longo para ocupar espaço de verdade e mais um monte de palavras aqui para inflar o payload do JSON acima de sete kilobytes, como o gh real faz com vinte issues abertas — e ainda mais texto de preenchimento para garantir que o corte de 1500 bytes caia bem no meio dos dados`,
+      url: `https://github.com/x/y/issues/${100 - i}`,
+      labels: [{ name: 'bug' }]
+    }))
+    const full = JSON.stringify(issues)
+    assert.ok(full.length > 7000, `payload grande como o gh real: ${full.length}`)
+    const cut = full.slice(1500) // o `[` inicial e o começo de algumas issues já não existem
+    // O esperado é derivado do próprio corte (que objeto começa DEPOIS da posição 1500),
+    // sem passar pelo parser: a primeira issue 100% completa após o corte.
+    const firstCompleteAt = issues.findIndex((_, i) => full.indexOf(`{"number":${100 - i}`) >= 1500)
+    const expected = issues.slice(firstCompleteAt)
+    assert.ok(expected.length >= 15, `corte deixa issues suficientes: ${expected.length}`)
+    const parsed = parseIssuesOutput(`${cut}\nISSUES_DONE`)
+    assert.equal(parsed.error, undefined, `não recuperou: ${parsed.error}`)
+    assert.deepEqual(
+      parsed.issues.map((issue) => issue.number),
+      expected.map((issue) => issue.number),
+      'as issues completas após o corte, na ordem original'
+    )
+    assert.ok(
+      parsed.issues.every((issue) => issue.number <= 100 - firstCompleteAt),
+      'a issue cortada não volta inventada'
+    )
+  })
+
   test('corta em 20 issues (máximo do painel)', () => {
     const many = JSON.stringify(
       Array.from({ length: 25 }, (_, i) => ({ number: i + 1, title: `t${i}`, url: 'u', labels: [] }))
