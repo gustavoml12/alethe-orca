@@ -6369,6 +6369,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     gate_parser.add_argument("action", choices=["status", "approve", "reject"])
     gate_parser.add_argument("--in", dest="into", metavar="FOLDER", default="current")
     gate_parser.add_argument("--label", default=None)
+    nds_event_parser = subparsers.add_parser(
+        "nds-event", help="NDS: publish a write-back event to the GitLab issue")
+    nds_event_parser.add_argument("event", choices=[
+        "spec-rejected", "spec-approved", "wave-done",
+        "gate-waiting", "gate-approved", "gate-rejected", "abort", "final"])
+    nds_event_parser.add_argument("--in", dest="into", metavar="FOLDER", default="current")
+    nds_event_parser.add_argument("--text", default="")
+    nds_event_parser.add_argument("--report", default=None,
+                                  help="folder or run dir to build the tokens/models table from")
     report_parser = subparsers.add_parser(
         "report", help="explain what runs did, why, and what they reported spending"
     )
@@ -6675,6 +6684,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             except nds.GateError as error:
                 print(f"error: {error}", file=sys.stderr)
                 return 2
+            return 0
+        if args.command == "nds-event":
+            if nds is None:
+                raise PlanError("NDS fork helpers are not installed (nds.py missing)")
+            folder = resolve_folder(None if args.into == "current" else Path(args.into))
+            report = None
+            if args.report:
+                report = build_report(find_run_dirs([Path(args.report)]), folder)
+            elif args.event in ("wave-done", "final"):
+                try:
+                    report = build_report(wave_dirs(folder), folder)
+                except Exception:
+                    report = None
+            nds.notify(folder, args.event, report, text=args.text)
             return 0
         policy_path = (args.policy or default_policy_path()).expanduser().resolve()
         run_dir = args.run_dir

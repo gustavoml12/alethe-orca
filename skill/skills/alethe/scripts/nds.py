@@ -164,3 +164,85 @@ def gate_wait(folder: Path, label: str, timeout_hours: float = 24.0,
             return 3
         if poll_seconds > 0:
             time.sleep(poll_seconds)
+
+
+def load_config(folder: Path) -> Dict[str, Any]:
+    config: Dict[str, Any] = {}
+    try:
+        loaded = json.loads((folder / CONFIG_FILE).read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            config = loaded
+    except (OSError, ValueError):
+        pass
+    env_issue = os.environ.get(ISSUE_ENV, "").strip()
+    if env_issue:
+        config["issue"] = env_issue
+    return config
+
+
+def _row(worker: Dict[str, Any]) -> str:
+    tokens = worker.get("tokens")
+    cost = worker.get("costUsd")
+    return (f"| {worker.get('label') or worker.get('id') or '?'} "
+            f"| {worker.get('model') or '—'} | {worker.get('status') or '?'} "
+            f"| {tokens if tokens is not None else '—'} "
+            f"| {'$' + format(cost, '.2f') if cost is not None else '—'} |")
+
+
+def format_comment(event: str, report: Optional[Dict[str, Any]], text: str = "") -> str:
+    titles = {
+        "spec-rejected": "Spec reprovada na validação",
+        "spec-approved": "Spec aprovada nas 5 categorias",
+        "wave-done": "Wave concluída",
+        "gate-waiting": "⛔ Gate aguardando aprovação humana",
+        "gate-approved": "Gate aprovado",
+        "gate-rejected": "Gate recusado — pipeline abortado",
+        "abort": "Pipeline abortado",
+        "final": "Pipeline concluído",
+    }
+    lines = [f"### {titles.get(event, event)}", ""]
+    if text:
+        lines += [text, ""]
+    if report and report.get("workers"):
+        lines += ["| Etapa | Modelo | Status | Tokens | Custo |",
+                  "|---|---|---|---|---|"]
+        lines += [_row(w) for w in report["workers"]]
+        totals = report.get("totals") or {}
+        if totals.get("tokens") is not None:
+            cost = totals.get("costUsd")
+            lines += [f"| **Total** | | | **{totals['tokens']}** "
+                      f"| **{'$' + format(cost, '.2f') if cost is not None else '—'}** |"]
+        lines.append("")
+    lines.append(f"_evento: `{event}` · {_now()}_")
+    return "\n".join(lines)
+
+
+def _append_pending(folder: Path, event: str, body: str) -> None:
+    with (folder / PENDING_FILE).open("a", encoding="utf-8") as handle:
+        handle.write(f"\n## {event} — {_now()}\n\n{body}\n")
+
+
+def notify(folder: Path, event: str, report: Optional[Dict[str, Any]] = None,
+           text: str = "") -> int:
+    """Best-effort GitLab comment; never raises, never fails the pipeline."""
+    if not folder.is_dir():
+        return 0
+    body = format_comment(event, report, text)
+    config = load_config(folder)
+    issue = str(config.get("issue") or "").strip()
+    if not issue:
+        _append_pending(folder, event, body)
+        return 0
+    cmd = ["glab", "issue", "note", issue, "-m", body]
+    repo = str(config.get("repo") or "").strip()
+    if repo:
+        cmd += ["--repo", repo]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        _append_pending(folder, event, body)
+        return 0
+    if result.returncode != 0:
+        _append_pending(folder, event, body)
+        return 0
+    return 0
