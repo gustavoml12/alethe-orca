@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S \"${CLAUDE_PLUGIN_ROOT}/skills/alethe/scripts/hook.py\" 2>/dev/null || python -S \"${CLAUDE_PLUGIN_ROOT}/skills/alethe/scripts/hook.py\" 2>/dev/null || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S \"${CLAUDE_PLUGIN_ROOT}/skills/alethe/scripts/hook.py\" 2>/dev/null || python -S \"${CLAUDE_PLUGIN_ROOT}/skills/alethe/scripts/hook.py\" 2>/dev/null || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
