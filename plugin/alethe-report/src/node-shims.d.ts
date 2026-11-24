@@ -4,4 +4,10 @@
 declare module 'node:child_process' {
   /** Runs `command` through a shell and returns its stdout as text. */
   export function execSync(command: string, options: { encoding: string }): string
+  /** Runs `argv` directly (no extra shell layer) and returns its stdout as text. */
+  export function spawnSync(
+    file: string,
+    args: readonly string[],
+    options: { encoding: string }
+  ): { stdout: string; error?: Error }
 }

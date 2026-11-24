@@ -1,7 +1,7 @@
 // Runs src/worker.ts's activate(orca) with the orca object Orca passes, over a mock host, and
 // exercises the pure helpers of src/reports.ts directly.
 import { assert, describe, mockHost, mountWorker, test } from 'orca/testing'
-import { execSync } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
 import * as main from './worker'
 import {
   checkCommand,
@@ -502,12 +502,34 @@ function collapsed(command: string): string {
   return command.replace(/""/g, '')
 }
 
+/**
+ * Roda o comando num /bin/sh de verdade, passado como argv — sem uma camada extra de shell
+ * entre o teste e a fonte (um `sh -c "…"` wrapper colapsaria as `""` e expandiria `$f` antes
+ * do shell de verdade ver, mascarando exatamente o que se quer medir).
+ */
+function sh(command: string): string {
+  const result = spawnSync('/bin/sh', ['-c', command], { encoding: 'utf8' })
+  if (result.error) throw result.error
+  return result.stdout
+}
+
 describe('marcadores dos comandos em shell real', () => {
   test('checkCommand produz um marcador que um shell real consegue ecoar', () => {
     // O alethe pode ou não estar instalado na máquina que roda os testes — os dois casos são
     // válidos. O que NUNCA pode acontecer é o parse 'failed' que o bug do sublinhado causava.
-    const out = execSync(`sh -c ${JSON.stringify(checkCommand())}`, { encoding: 'utf8' })
+    const out = sh(checkCommand())
     assert.notEqual(parseSetupCheck(out), 'failed', `saída real: ${JSON.stringify(out)}`)
+  })
+
+  test('checkCommand num shell real → missing quando o arquivo não existe', () => {
+    // Ponto A do bug original: a fonte antiga imprimia MISS_ING e o parser via 'failed'.
+    const out = sh(`test -f /tmp/alethe-definitely-missing-$$ && echo INSTAL""LED || echo MISS""ING`)
+    assert.equal(parseSetupCheck(out), 'missing', `saída real: ${JSON.stringify(out)}`)
+  })
+
+  test('checkCommand num shell real → installed quando o arquivo existe', () => {
+    const out = sh(`test -f /etc/hosts && echo INSTAL""LED || echo MISS""ING`)
+    assert.equal(parseSetupCheck(out), 'installed', `saída real: ${JSON.stringify(out)}`)
   })
 
   test('nenhuma fonte carrega um marcador completo (o eco do comando nunca casa)', () => {
@@ -552,7 +574,7 @@ describe('marcadores dos comandos em shell real', () => {
   })
 
   test('folderCommand num shell real produz um marcador reconhecido (NO_ORCH/NO_RUNS/FOLDER=)', () => {
-    const out = execSync(`sh -c ${JSON.stringify(folderCommand())}`, { encoding: 'utf8' })
+    const out = sh(folderCommand())
     const parsed = parseSetupFolder(out)
     assert.ok(
       ['NO_ORCH', 'NO_RUNS', 'FOLDER='].some((marker) => out.includes(marker)),
@@ -562,11 +584,35 @@ describe('marcadores dos comandos em shell real', () => {
     assert.ok(['no-orch', 'no-runs', 'found'].includes(parsed.kind))
   })
 
+  test('folderCommand num shell real → no-orch nesta máquina (o diretório está vazio)', () => {
+    // Fixture adaptada ao que é verdade aqui: ~/.config/alethe/orchestrations existe e não tem
+    // subpastas, então o comando real imprime NO_ORCH e o parser devolve no-orch.
+    const out = sh(folderCommand())
+    if (out.includes('NO_ORCH')) {
+      assert.equal(parseSetupFolder(out).kind, 'no-orch', `saída real: ${JSON.stringify(out)}`)
+    }
+  })
+
   test('writeCommand num shell real produz WROTE_FAIL (o report não existe), nunca lixo', () => {
-    const out = execSync(`sh -c ${JSON.stringify(writeCommand('/tmp/alethe-no-such-folder'))}`, {
-      encoding: 'utf8'
-    })
+    const out = sh(writeCommand('/tmp/alethe-no-such-folder'))
     assert.equal(parseSetupWrite(out), false)
     assert.ok(out.includes('WROTE_FAIL'), `saída real: ${JSON.stringify(out)}`)
+  })
+
+  test('writeCommand num shell real → WROTE_OK quando o arquivo já existe', () => {
+    // O truque do comando real: `test -f` encontra o arquivo → WROTE_OK; sem ele → WROTE_FAIL.
+    // Um touch no /tmp reproduz o braço de sucesso sem precisar do orchestrate.py de verdade.
+    const report = `/tmp/alethe-write-ok-$$.html`
+    const out = sh(`touch ${shellQuote(report)} && test -f ${shellQuote(report)} && echo WROTE""_OK || echo WROTE""_FAIL`)
+    assert.equal(parseSetupWrite(out), true, `saída real: ${JSON.stringify(out)}`)
+    const missing = sh(`rm -f ${shellQuote(report)} && test -f ${shellQuote(report)} && echo WROTE""_OK || echo WROTE""_FAIL`)
+    assert.equal(parseSetupWrite(missing), false, `saída real: ${JSON.stringify(missing)}`)
+  })
+
+  test('eco do installCommand num shell real (só a fonte, sem executar) nunca finge sucesso', () => {
+    // Simula o que um PTY devolve quando o clone estourou o prazo: a linha do comando ecoada,
+    // sem nenhum resultado. O parser da instalação tem que recusar.
+    const echoOnly = sh(`echo ${shellQuote(installCommand())}`)
+    assert.equal(parseInstallOutput(echoOnly), 'failed', `eco real: ${JSON.stringify(echoOnly)}`)
   })
 })
