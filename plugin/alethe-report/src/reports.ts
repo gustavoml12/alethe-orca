@@ -442,11 +442,16 @@ export async function setupReport(host: Host): Promise<SetupResult> {
 
 /** One ephemeral command: the remote picks the forge, then the list, then the marker. */
 export function issuesCommand(): string {
+  // `tr -d '\n'` em AMBOS os braços: em TTY o gh/glab imprime JSON PRETTY (29 issues →
+  // 1000+ linhas), mas o terminal.read do Orca devolve só as 200 mais NOVAS — o `[`
+  // inicial é cortado e o parse cai no meio do array. Pretty-print newlines são whitespace
+  // de JSON; newlines reais dentro de strings já vêm escapadas como `\n` (2 bytes), então
+  // apagá-las é seguro e o payload vira UMA linha que o corte nunca alcança.
   return (
     'url=$(git remote get-url origin 2>/dev/null); ' +
     'if [ -z "$url" ]; then echo NO""_REPO; ' +
-    'elif echo "$url" | grep -qi gitlab; then glab issue list -O json; ' +
-    'else gh issue list --limit 20 --json number,title,url,labels --state open; fi; ' +
+    'elif echo "$url" | grep -qi gitlab; then glab issue list -O json | tr -d \'\\n\'; ' +
+    'else gh issue list --limit 20 --json number,title,url,labels --state open | tr -d \'\\n\'; fi; ' +
     'echo ISSUES""_DONE'
   )
 }

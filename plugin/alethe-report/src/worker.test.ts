@@ -884,6 +884,52 @@ describe('issuesCommand', () => {
     assert.ok(collapsed(issuesCommand()).includes('echo NO_REPO'))
     assert.ok(collapsed(issuesCommand()).includes('echo ISSUES_DONE'))
   })
+
+  // ROOT CAUSE (reproduzido ao vivo): em TTY o gh imprime JSON PRETTY (29 issues → 1000+
+  // linhas), mas o terminal.read do Orca devolve só as 200 mais NOVAS — o começo do array
+  // (com o `[` inicial) é cortado e o parse cai no meio do array. O pipe `tr -d '\n'` deixa
+  // o payload em UMA linha antes do eco/read, então as 200 linhas nunca cortam o JSON.
+  test("output pretty de 300 linhas parseia após o tr -d \\n (regra do terminal.read)", () => {
+    const build = [
+      'rm -rf /tmp/ndsfake && mkdir -p /tmp/ndsfake',
+      // fake gh E fake glab (o remote decide qual roda): imprimem um array JSON PRETTY
+      // de >200 linhas (10 issues + linhas em branco de espaço entre elementos), exit 0
+      `printf '#!/bin/sh\\ncat <<'\\''JSON'\\''\\n[\\n' > /tmp/ndsfake/gh`,
+      `for i in $(seq 1 10); do if [ "$i" -gt 1 ]; then printf ',\\n' >> /tmp/ndsfake/gh; fi; printf '  {\\n    "number": %s,\\n    "title": "t%s",\\n    "url": "https://x/%s",\\n    "labels": [{"name": "a"}]\\n  }\\n' "$i" "$i" "$i" >> /tmp/ndsfake/gh; printf '\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n' >> /tmp/ndsfake/gh; done`,
+      `printf ']\\nJSON\\n' >> /tmp/ndsfake/gh`,
+      'chmod +x /tmp/ndsfake/gh',
+      'cp /tmp/ndsfake/gh /tmp/ndsfake/glab'
+    ].join('; ')
+    const built = spawnSync('/bin/sh', ['-c', build], { encoding: 'utf8' })
+    assert.equal(built.error, undefined, 'construção do fake falhou')
+    // A condição que bitou: o fake EMITE mais de 200 linhas de JSON pretty.
+    const raw = spawnSync('/bin/sh', ['-c', '/tmp/ndsfake/gh | wc -l'], { encoding: 'utf8' })
+    assert.ok(
+      Number(raw.stdout.trim()) > 200,
+      `o fake gh deve emitir >200 linhas pretty: ${raw.stdout.trim()}`
+    )
+    // O comando REAL, com o fake na PATH, cortado como o terminal.read do Orca corta
+    // (só as 200 linhas mais novas chegam ao parser — as de cima, com o `[`, somem).
+    // Os parênteses envolvem o comando INTEIRO: sem eles o `| tail` pegaria só o echo.
+    const script = [
+      'rm -rf /tmp/ndsfake-cut',
+      'mkdir -p /tmp/ndsfake-cut',
+      'cd /tmp/ndsfake-cut',
+      // remote github (sem ele o comando cairia no braço NO_REPO, não no gh)
+      'git init -q . && git remote add origin https://github.com/gustavoml12/alethe-orca.git',
+      'export PATH=/tmp/ndsfake:$PATH',
+      '(' + issuesCommand() + ') | tail -n 200'
+    ].join('; ')
+    const out = spawnSync('/bin/sh', ['-c', script], { encoding: 'utf8' }).stdout
+    const parsed = parseIssuesOutput(out)
+    assert.equal(parsed.error, undefined, `parse falhou: ${parsed.error}`)
+    assert.equal(parsed.issues.length, 10, 'todos os issues parseados apesar do corte')
+    assert.equal(
+      parsed.issues[0]?.number,
+      1,
+      'o primeiro issue sobrevive: sem o tr -d \\n o `[` inicial é cortado'
+    )
+  })
 })
 
 describe('parseIssuesOutput', () => {
