@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -117,6 +118,28 @@ def _prompt(label: str, folder: Path) -> None:
     print(f'ou rode em outro terminal:  orchestrate.py gate approve --in "{folder}"', flush=True)
 
 
+def _stdin_watcher(folder: Path, label: str) -> None:
+    """Daemon thread: read one stdin line and record the decision in gate.json.
+
+    Kept off the main loop so the file poll, cross-terminal approval and the
+    deadline keep running while this blocks on readline (TTY only; returns
+    immediately when stdin is not a TTY).
+    """
+    line = _stdin_line()
+    if not line:
+        return
+    word = line.strip().lower()
+    try:
+        if word in APPROVE_WORDS:
+            gate_approve(folder, label)
+        elif word in REJECT_WORDS:
+            gate_reject(folder, label)
+        else:
+            print("Resposta não reconhecida; use sim/nao.", flush=True)
+    except GateError as error:
+        print(f"gate: {error}", flush=True)
+
+
 def gate_wait(folder: Path, label: str, timeout_hours: float = 24.0,
               poll_seconds: float = 2.0) -> int:
     """Block until the gate for `label` is approved (0) or rejected/expired (3)."""
@@ -127,18 +150,9 @@ def gate_wait(folder: Path, label: str, timeout_hours: float = 24.0,
         return 3
     _write_gate(folder, "waiting", label, "terminal")
     _prompt(label, folder)
+    threading.Thread(target=_stdin_watcher, args=(folder, label), daemon=True).start()
     deadline = time.monotonic() + (timeout_hours * 3600)
     while True:
-        line = _stdin_line()
-        if line:
-            word = line.strip().lower()
-            if word in APPROVE_WORDS:
-                gate_approve(folder, label)
-                return 0
-            if word in REJECT_WORDS:
-                gate_reject(folder, label)
-                return 3
-            print("Resposta não reconhecida; use sim/nao.", flush=True)
         state = _read_gate(folder) or {}
         if state.get("state") == "approved":
             return 0

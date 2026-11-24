@@ -69,6 +69,13 @@ class GateStateTest(unittest.TestCase):
         out = nds.gate_reject(folder2, "b")
         self.assertEqual(out["state"], "rejected")
 
+    def test_stdin_watcher_records_approval(self):
+        with mock.patch.object(nds, "_stdin_line", return_value="sim"):
+            nds._stdin_watcher(self.folder, "w")
+        state = json.loads((self.folder / "gate.json").read_text())
+        self.assertEqual(state["state"], "approved")
+        self.assertEqual(state["label"], "w")
+
 
 if __name__ == "__main__":
     unittest.main()
