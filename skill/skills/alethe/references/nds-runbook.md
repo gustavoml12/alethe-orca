@@ -18,6 +18,7 @@ Após a resposta do lead:
     python3 skills/alethe/scripts/orchestrate.py spec rejected --in current --text "<falhas>"
     # ou
     python3 skills/alethe/scripts/orchestrate.py spec approved --in current
+- **Máximo 2 reprovações; a 3ª aborta o fluxo automaticamente** (o próprio comando `spec rejected` retorna exit 2 e publica `abort` na issue na 3ª ocorrência).
 
 ## ⛔ GATE HUMANO (obrigatório, nativo)
 O lead NÃO inicia a wave 3 sem o gate. O runner pausa sozinho:
