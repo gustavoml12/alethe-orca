@@ -4,11 +4,18 @@ import { assert, describe, mockHost, mountWorker, test } from 'orca/testing'
 import * as main from './worker'
 import {
   findCommand,
+  folderCommand,
+  installCommand,
   isReportPath,
   judgeTabCreate,
   listReports,
   parseFindOutput,
+  parseSetupCheck,
+  parseSetupFolder,
+  parseSetupWrite,
+  setupReport,
   shellQuote,
+  writeCommand,
   type Host
 } from './reports'
 
@@ -184,6 +191,260 @@ describe('open-report handler', () => {
     assert.equal(res.via, 'none')
     assert.match(res.error ?? '', /report\.html/)
     assert.deepEqual(tw.host.callsOf('terminal.create'), [], 'sem terminal.create, sem shell')
+    await tw.deactivate()
+  })
+})
+
+/** The orchestration folder a scripted run "finds"; the command echoes it with a trailing `/`. */
+const FOLDER = '/home/u/.config/alethe/orchestrations/o1'
+
+/** Answers each `terminal.create` from the command it carries, so a whole flow runs unattended. */
+function scriptedHost(answer: (command: string) => string): {
+  host: Host
+  created: string[]
+  closed: string[]
+} {
+  const created: string[] = []
+  const closed: string[] = []
+  const outputs = new Map<string, string>()
+  let seq = 0
+  const host: Host = {
+    call: async (method, params) => {
+      if (method === 'workspace.readContext') return { workspaceId: 'w1' }
+      if (method === 'terminal.create') {
+        const command = String((params as { command?: string }).command ?? '')
+        created.push(command)
+        seq += 1
+        const id = `t${seq}`
+        outputs.set(id, answer(command))
+        return { terminalId: id }
+      }
+      if (method === 'terminal.read') {
+        const id = String((params as { terminalId?: string }).terminalId ?? '')
+        return { lines: [outputs.get(id) ?? ''], truncated: false }
+      }
+      if (method === 'terminal.close') {
+        closed.push(String((params as { terminalId?: string }).terminalId ?? ''))
+        return { closed: true }
+      }
+      return {}
+    }
+  }
+  return { host, created, closed }
+}
+
+/** Routes a scripted command to the step's answer, by the marker each command carries. */
+function flowScript(step: {
+  check: string
+  install?: string
+  folder: string
+  write?: string
+}): (command: string) => string {
+  return (command) => {
+    if (command.includes('orchestrate.py report')) return step.write ?? 'WROTE_FAIL'
+    if (command.includes('ls -td')) return step.folder
+    if (command.includes('git clone')) return step.install ?? 'INSTALL_FAILED'
+    return step.check
+  }
+}
+
+describe('parseSetupCheck', () => {
+  test('INSTALLED e INSTALLED_OK contam como instalado', () => {
+    assert.equal(parseSetupCheck('INSTALLED'), 'installed')
+    assert.equal(parseSetupCheck('INSTALLED_OK'), 'installed')
+  })
+
+  test('MISSING → missing', () => {
+    assert.equal(parseSetupCheck('MISSING'), 'missing')
+  })
+
+  test('INSTALL_FAILED → failed', () => {
+    assert.equal(parseSetupCheck('INSTALL_FAILED'), 'failed')
+  })
+
+  test('saída sem marcador reconhecido → failed', () => {
+    assert.equal(parseSetupCheck('command not found: test'), 'failed')
+    assert.equal(parseSetupCheck(''), 'failed')
+  })
+
+  test('o eco do comando no PTY não decide o resultado (último marcador vence)', () => {
+    assert.equal(parseSetupCheck(`test -f x && echo INSTALLED || echo MISSING\nMISSING`), 'missing')
+    assert.equal(parseSetupCheck(`test -f x && echo INSTALLED || echo MISSING\nINSTALLED`), 'installed')
+    assert.equal(parseSetupCheck(`${installCommand()}\nINSTALL_FAILED`), 'failed')
+    assert.equal(parseSetupCheck(`${installCommand()}\nINSTALLED_OK`), 'installed')
+  })
+})
+
+describe('parseSetupFolder', () => {
+  test('NO_ORCH → no-orch', () => {
+    assert.equal(parseSetupFolder('NO_ORCH').kind, 'no-orch')
+  })
+
+  test('NO_RUNS → no-runs', () => {
+    assert.equal(parseSetupFolder('NO_RUNS').kind, 'no-runs')
+  })
+
+  test('FOLDER= devolve a pasta sem barra final', () => {
+    const parsed = parseSetupFolder(`FOLDER=${FOLDER}/`)
+    assert.equal(parsed.kind, 'found')
+    assert.equal(parsed.kind === 'found' ? parsed.folder : '', FOLDER)
+  })
+
+  test('eco do comando não engana: o resultado real é o último', () => {
+    assert.equal(parseSetupFolder(`${folderCommand()}\nNO_RUNS`).kind, 'no-runs')
+    const parsed = parseSetupFolder(`${folderCommand()}\nFOLDER=${FOLDER}/`)
+    assert.equal(parsed.kind === 'found' ? parsed.folder : '', FOLDER)
+  })
+})
+
+describe('parseSetupWrite', () => {
+  test('WROTE_OK → true, WROTE_FAIL → false', () => {
+    assert.equal(parseSetupWrite('WROTE_OK'), true)
+    assert.equal(parseSetupWrite('WROTE_FAIL'), false)
+    assert.equal(parseSetupWrite(''), false)
+  })
+
+  test('eco do comando não engana', () => {
+    const command = writeCommand(FOLDER)
+    assert.equal(parseSetupWrite(`${command}\nWROTE_OK`), true)
+    assert.equal(parseSetupWrite(`${command}\nWROTE_FAIL`), false)
+  })
+})
+
+describe('setupReport over an injected host', () => {
+  test('instala, acha a pasta e gera o relatório; um close por terminal criado', async () => {
+    const { host, created, closed } = scriptedHost(
+      flowScript({
+        check: 'MISSING',
+        install: 'INSTALLED_OK',
+        folder: `FOLDER=${FOLDER}/`,
+        write: 'WROTE_OK'
+      })
+    )
+    const res = await setupReport(host)
+    assert.equal(res.status, 'generated')
+    assert.equal(res.installed, true, 'esta chamada instalou o alethe')
+    assert.equal(res.path, `${FOLDER}/report.html`)
+    assert.equal(res.detail, 'Relatório gerado ✓')
+    assert.equal(created.length, 4, 'check, install, folder, write')
+    assert.deepEqual(closed, ['t1', 't2', 't3', 't4'], 'cada terminal criado é fechado no finally')
+    assert.ok(created[3].includes(shellQuote(FOLDER)), 'a pasta vai entre aspas simples no comando')
+  })
+
+  test('já instalado pula o clone (nenhum comando de git clone enviado)', async () => {
+    const { host, created } = scriptedHost(
+      flowScript({ check: 'INSTALLED', folder: `FOLDER=${FOLDER}/`, write: 'WROTE_OK' })
+    )
+    const res = await setupReport(host)
+    assert.equal(res.status, 'generated')
+    assert.equal(res.installed, false, 'não instalou nada nesta chamada')
+    assert.equal(created.length, 3, 'sem o passo de instalação')
+    assert.deepEqual(
+      created.filter((command) => command.includes('git clone')),
+      [],
+      'clone nunca enviado'
+    )
+  })
+
+  test('NO_RUNS → no-runs e nenhum comando de relatório', async () => {
+    const { host, created } = scriptedHost(flowScript({ check: 'INSTALLED', folder: 'NO_RUNS' }))
+    const res = await setupReport(host)
+    assert.equal(res.status, 'no-runs')
+    assert.equal(res.installed, false)
+    assert.match(res.detail, /\/alethe/, 'diz como começar')
+    assert.deepEqual(
+      created.filter((command) => command.includes('orchestrate.py report')),
+      [],
+      'sem comando de relatório'
+    )
+  })
+
+  test('instalou agora e não há execuções → o detalhe diz que o alethe foi instalado', async () => {
+    const { host } = scriptedHost(
+      flowScript({ check: 'MISSING', install: 'INSTALLED_OK', folder: 'NO_ORCH' })
+    )
+    const res = await setupReport(host)
+    assert.equal(res.status, 'no-runs')
+    assert.equal(res.installed, true)
+    assert.match(res.detail, /Alethe instalado ✓/)
+    assert.match(res.detail, /\/alethe/)
+  })
+
+  test('clone falhou → failed com a dica do gh auth e nada além do clone', async () => {
+    const { host, created } = scriptedHost(
+      flowScript({ check: 'MISSING', install: 'INSTALL_FAILED', folder: 'NO_RUNS' })
+    )
+    const res = await setupReport(host)
+    assert.equal(res.status, 'failed')
+    assert.equal(res.installed, false)
+    assert.match(res.detail, /gh auth login/)
+    assert.equal(created.length, 2, 'para depois do clone')
+  })
+
+  test('WROTE_FAIL → failed com a pasta no detalhe', async () => {
+    const { host } = scriptedHost(
+      flowScript({ check: 'INSTALLED', folder: `FOLDER=${FOLDER}/`, write: 'WROTE_FAIL' })
+    )
+    const res = await setupReport(host)
+    assert.equal(res.status, 'failed')
+    assert.equal(res.installed, false)
+    assert.ok(res.detail.includes(FOLDER), 'o detalhe nomeia a pasta')
+  })
+
+  test('sem workspace focado → failed como dado, sem exceção', async () => {
+    const host: Host = { call: async () => null }
+    const res = await setupReport(host)
+    assert.equal(res.status, 'failed')
+    assert.match(res.detail, /workspace/)
+  })
+})
+
+describe('setup-report handler', () => {
+  test('roda o fluxo completo pela host e fecha cada terminal', async () => {
+    const tw = await mountWorker(main)
+    const outputs = new Map<string, string>()
+    const script = flowScript({
+      check: 'MISSING',
+      install: 'INSTALLED_OK',
+      folder: `FOLDER=${FOLDER}/`,
+      write: 'WROTE_OK'
+    })
+    let seq = 0
+    tw.host.respond('workspace.readContext', CONTEXT)
+    tw.host.respond('terminal.create', (params: { command?: string }) => {
+      seq += 1
+      const id = `t${seq}`
+      outputs.set(id, script(String(params.command ?? '')))
+      return { terminalId: id }
+    })
+    tw.host.respond('terminal.read', (params: { terminalId?: string }) => ({
+      lines: [outputs.get(String(params.terminalId ?? '')) ?? ''],
+      truncated: false
+    }))
+    tw.host.respond('terminal.close', { closed: true })
+    const res = await tw.request('setup-report')
+    assert.equal(res.status, 'generated')
+    assert.equal(res.installed, true)
+    assert.equal(res.path, `${FOLDER}/report.html`)
+    assert.equal(tw.host.callsOf('terminal.close').length, 4)
+    await tw.deactivate()
+  })
+
+  test('falha do clone chega como resposta, não como exceção', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', CONTEXT)
+    tw.host.respond('terminal.create', (params: { command?: string }) => ({
+      terminalId: params.command?.includes('git clone') ? 'clone' : 'check'
+    }))
+    tw.host.respond('terminal.read', (params: { terminalId?: string }) => ({
+      lines: [params.terminalId === 'clone' ? 'INSTALL_FAILED' : 'MISSING'],
+      truncated: false
+    }))
+    tw.host.respond('terminal.close', { closed: true })
+    const res = await tw.request('setup-report')
+    assert.equal(res.status, 'failed')
+    assert.match(res.detail, /gh auth login/)
+    assert.deepEqual(tw.host.callsOf('terminal.create').length, 2, 'para depois do clone')
     await tw.deactivate()
   })
 })

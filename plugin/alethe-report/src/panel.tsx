@@ -12,7 +12,7 @@ import {
   Text,
   update
 } from 'orca'
-import type { ReportList } from './reports'
+import type { ReportList, SetupResult } from './reports'
 
 /** What the empty and error states show, worded exactly as the spec words it. */
 const INSTRUCTION = 'Rode `/alethe report html` no terminal do projeto'
@@ -47,10 +47,64 @@ export async function load(req: () => Promise<ReportList>): Promise<PanelState> 
 const state = atom<PanelState>({ kind: 'loading' })
 /** What the last "Abrir" press answered, inline feedback by report path. */
 const notes = atom<Record<string, { text: string; tone: 'success' | 'danger' }>>({})
+/** One "Preparar e gerar" answer, inline above the list (or the empty state); `null` when none. */
+const setupNote = atom<{ text: string; tone: 'success' | 'danger' | 'accent' } | null>(null)
+/** Whether a setup run is in flight, so one click cannot start a second. */
+const setupBusy = atom(false)
 
 /** One list request end to end; `load` turns any failure into the error state. */
 async function refresh(): Promise<void> {
   set(state, await load(() => plugin.request('list-reports')))
+}
+
+/**
+ * Pure: one `setup-report` answer, with the request function injected so the seam tests without
+ * a host (same shape as `load`). A rejected request becomes `failed` data — the frame never sees
+ * an exception.
+ */
+export async function runSetup(req: () => Promise<SetupResult>): Promise<SetupResult> {
+  try {
+    return await req()
+  } catch (err) {
+    return { status: 'failed', installed: false, detail: String(err) }
+  }
+}
+
+/**
+ * The "Preparar e gerar relatório" press: one click that installs alethe if missing and writes
+ * report.html. A `generated` answer is followed by `open-report` (the panel's own way of showing
+ * it, one click ends with the report open) and a list refresh; every outcome lands as an inline
+ * note — never a thrown exception.
+ */
+async function prepare(): Promise<void> {
+  if (read(setupBusy)) return
+  set(setupBusy, true)
+  set(setupNote, null)
+  try {
+    const result = await runSetup(() => plugin.request('setup-report'))
+    if (result.status === 'generated' && result.path) {
+      let text = 'Relatório gerado e aberto ✓'
+      let tone: 'success' | 'danger' = 'success'
+      try {
+        const open = await plugin.request('open-report', { path: result.path })
+        if (!open.opened) {
+          text = `Relatório gerado ✓ — ${open.error ?? 'não foi possível abrir'}`
+          tone = 'danger'
+        }
+      } catch (err) {
+        text = `Relatório gerado ✓ — ${String(err)}`
+        tone = 'danger'
+      }
+      set(setupNote, { text, tone })
+    } else if (result.status === 'no-runs') {
+      set(setupNote, { text: result.detail, tone: 'accent' })
+    } else {
+      set(setupNote, { text: result.detail, tone: 'danger' })
+    }
+    await refresh()
+  } finally {
+    set(setupBusy, false)
+  }
 }
 
 /** The "Recarregar" press: show loading at once, then whatever the worker answers. */
@@ -98,14 +152,35 @@ function contextOf(path: string): string {
 export default function Panel() {
   const current = read(state)
   const allNotes = read(notes)
+  const note = read(setupNote)
+  const busy = read(setupBusy)
+  /** The one-click button; hidden while loading, drawn where a stale or absent list needs it. */
+  const prepareButton = (size?: 'sm') => (
+    <Button
+      size={size ?? 'md'}
+      variant="solid"
+      disabled={busy}
+      onPress={prepare}
+    >
+      ⚙️ Preparar e gerar relatório
+    </Button>
+  )
   return (
     <Stack gap="md">
       <Row justify="between" align="center">
         <Heading level={2}>Alethe Reports</Heading>
-        <Button size="sm" variant="ghost" icon="refresh" onPress={reload}>
-          Recarregar
-        </Button>
+        <Row gap="sm" align="center">
+          {current.kind === 'ready' && prepareButton('sm')}
+          <Button size="sm" variant="ghost" icon="refresh" onPress={reload}>
+            Recarregar
+          </Button>
+        </Row>
       </Row>
+      {note && (
+        <Text size="sm" tone={note.tone}>
+          {note.text}
+        </Text>
+      )}
       {current.kind === 'loading' && <Text muted>Carregando relatórios…</Text>}
       {current.kind === 'ready' && (
         <Stack gap="sm">
@@ -144,6 +219,7 @@ export default function Panel() {
               {current.message}
             </Text>
           )}
+          {prepareButton()}
           <EmptyState title="Nenhum relatório" description={current.instruction} icon="file-text" />
         </Stack>
       )}

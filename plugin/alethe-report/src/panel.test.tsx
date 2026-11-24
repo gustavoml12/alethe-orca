@@ -141,3 +141,151 @@ describe('panel render', () => {
     await view.unmount()
   })
 })
+
+const SETUP_BUTTON = /Preparar e gerar relatório/
+
+describe('runSetup (lógica do botão)', () => {
+  test('request rejeitada vira failed como dado, nunca exceção', async () => {
+    const result = await panel.runSetup(async () => {
+      throw new Error('worker off')
+    })
+    assert.equal(result.status, 'failed')
+    assert.match(result.detail, /worker off/)
+  })
+
+  test('resposta do worker passa adiante como está', async () => {
+    const result = await panel.runSetup(async () => ({
+      status: 'no-runs' as const,
+      installed: false,
+      detail: 'Inicie uma tarefa com /alethe'
+    }))
+    assert.equal(result.status, 'no-runs')
+    assert.equal(result.detail, 'Inicie uma tarefa com /alethe')
+  })
+})
+
+describe('botão preparar-e-gerar', () => {
+  test('empty → o botão aparece acima da instrução, sem erros nem recusas', async () => {
+    const host = mockHost({ requests: { 'list-reports': () => ({ reports: [] }) } })
+    const view = await mount(panel, { host })
+    assert.ok(view.find({ text: SETUP_BUTTON }), 'botão visível no estado vazio')
+    assert.ok(view.find({ text: INSTRUCTION }), 'instrução continua visível')
+    assert.deepEqual(view.errors, [])
+    assert.deepEqual(view.refusals, [])
+    await view.unmount()
+  })
+
+  test('ready → o botão fica ao lado de Recarregar', async () => {
+    const host = mockHost({
+      requests: { 'list-reports': () => ({ reports: [{ path: '/o1/report.html' }] }) }
+    })
+    const view = await mount(panel, { host })
+    assert.ok(view.find({ text: SETUP_BUTTON }), 'botão visível com a lista')
+    assert.ok(view.find({ text: 'Recarregar' }), 'Recarregar continua visível')
+    assert.deepEqual(view.errors, [])
+    await view.unmount()
+  })
+
+  test('generated → abre o path devolvido, recarrega a lista e mostra a nota de sucesso', async () => {
+    const sequence: string[] = []
+    let lists = 0
+    const host = mockHost({
+      requests: {
+        'list-reports': () => {
+          sequence.push('list-reports')
+          lists += 1
+          return lists === 1
+            ? { reports: [] }
+            : { reports: [{ path: '/o1/report.html' }] }
+        },
+        'setup-report': () => {
+          sequence.push('setup-report')
+          return {
+            status: 'generated' as const,
+            installed: true,
+            detail: 'Relatório gerado ✓',
+            path: '/o1/report.html'
+          }
+        },
+        'open-report': ({ path }) => {
+          sequence.push(`open-report:${path}`)
+          return { opened: true, via: 'browser-tab' as const }
+        }
+      }
+    })
+    const view = await mount(panel, { host })
+    await view.press({ text: SETUP_BUTTON })
+    assert.deepEqual(
+      sequence,
+      ['list-reports', 'setup-report', 'open-report:/o1/report.html', 'list-reports'],
+      'um clique: setup → abre → recarrega'
+    )
+    assert.ok(view.find({ text: /Relatório gerado e aberto ✓/ }), 'nota de sucesso visível')
+    assert.deepEqual(view.errors, [], 'nunca exceção no frame')
+    await view.unmount()
+  })
+
+  test('generated mas o open falha → nota com o erro do open, lista recarregada', async () => {
+    let lists = 0
+    const host = mockHost({
+      requests: {
+        'list-reports': () => {
+          lists += 1
+          return lists === 1 ? { reports: [] } : { reports: [{ path: '/o1/report.html' }] }
+        },
+        'setup-report': () => ({
+          status: 'generated' as const,
+          installed: false,
+          detail: 'Relatório gerado ✓',
+          path: '/o1/report.html'
+        }),
+        'open-report': () => ({ opened: false, via: 'none' as const, error: 'sem workspace focado' })
+      }
+    })
+    const view = await mount(panel, { host })
+    await view.press({ text: SETUP_BUTTON })
+    assert.ok(view.find({ text: /Relatório gerado/ }), 'gerado continua dito')
+    assert.ok(view.find({ text: /sem workspace focado/ }), 'erro do open anexado à nota')
+    assert.equal(lists, 2, 'lista recarregada mesmo com o open falhando')
+    assert.deepEqual(view.errors, [])
+    await view.unmount()
+  })
+
+  test('no-runs → nota informativa com o passo a passo do /alethe', async () => {
+    const host = mockHost({
+      requests: {
+        'list-reports': () => ({ reports: [] }),
+        'setup-report': () => ({
+          status: 'no-runs' as const,
+          installed: true,
+          detail:
+            'Alethe instalado ✓ — nenhuma tarefa orquestrada ainda. Inicie uma tarefa com /alethe no terminal do projeto e o relatório aparecerá aqui.'
+        })
+      }
+    })
+    const view = await mount(panel, { host })
+    await view.press({ text: SETUP_BUTTON })
+    assert.ok(view.find({ text: /Inicie uma tarefa com \/alethe/ }), 'instrução do /alethe visível')
+    assert.ok(view.find({ text: /Nenhum relatório/ }), 'estado vazio segue desenhado')
+    assert.deepEqual(view.errors, [])
+    await view.unmount()
+  })
+
+  test('failed → nota destrutiva com o detalhe, sem exceção', async () => {
+    const host = mockHost({
+      requests: {
+        'list-reports': () => ({ reports: [] }),
+        'setup-report': () => ({
+          status: 'failed' as const,
+          installed: false,
+          detail: 'Falha ao instalar o alethe (git clone). Confira sua autenticação GitHub (gh auth login) e tente de novo.'
+        })
+      }
+    })
+    const view = await mount(panel, { host })
+    await view.press({ text: SETUP_BUTTON })
+    assert.ok(view.find({ text: /gh auth login/ }), 'detalhe da falha visível')
+    assert.deepEqual(view.errors, [], 'nunca exceção no frame')
+    await view.unmount()
+  })
+})

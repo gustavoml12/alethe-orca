@@ -3,7 +3,16 @@
 // src/reports.ts over ephemeral terminals, so each function closes its own terminal in a
 // `finally` and answers failures as data (never as an exception the panel would choke on).
 import type { OrcaWorkerApi } from 'orca/worker'
-import { isReportPath, listReports, openReport, type Host, type OpenResult, type ReportList } from './reports'
+import {
+  isReportPath,
+  listReports,
+  openReport,
+  setupReport,
+  type Host,
+  type OpenResult,
+  type ReportList,
+  type SetupResult
+} from './reports'
 
 export default function activate(orca: OrcaWorkerApi): void {
   // The pure module takes a plain host; the worker's API is typed per method, hence the cast.
@@ -25,6 +34,14 @@ export default function activate(orca: OrcaWorkerApi): void {
     }
     const result = await openReport(host, path)
     if (result.error) orca.log(`open-report: ${result.error}`)
+    return result
+  })
+
+  // One click: install alethe when missing, find the newest folder with runs, render the
+  // report. Every failure arrives as `status: 'failed'` data, logged for the panel's note.
+  orca.panels.handle('setup-report', async (): Promise<SetupResult> => {
+    const result = await setupReport(host)
+    if (result.status === 'failed') orca.log(`setup-report: ${result.detail}`)
     return result
   })
 }
