@@ -76,6 +76,15 @@ class NotifyTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue((self.folder / "writeback-pending.md").is_file())
 
+    def test_notify_glab_failure_writes_pending(self):
+        env = self._fake_glab(fail=True)
+        with mock.patch.dict("os.environ", {"PATH": env}):
+            rc = nds.notify(self.folder, "wave-done", REPORT, text="falhou")
+        self.assertEqual(rc, 0)
+        pending = self.folder / "writeback-pending.md"
+        self.assertTrue(pending.is_file())
+        self.assertIn("wave-done", pending.read_text())
+
 
 class NdsEventCliTest(unittest.TestCase):
     def setUp(self):

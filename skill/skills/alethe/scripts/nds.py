@@ -225,24 +225,29 @@ def _append_pending(folder: Path, event: str, body: str) -> None:
 def notify(folder: Path, event: str, report: Optional[Dict[str, Any]] = None,
            text: str = "") -> int:
     """Best-effort GitLab comment; never raises, never fails the pipeline."""
-    if not folder.is_dir():
-        return 0
-    body = format_comment(event, report, text)
-    config = load_config(folder)
-    issue = str(config.get("issue") or "").strip()
-    if not issue:
-        _append_pending(folder, event, body)
-        return 0
-    cmd = ["glab", "issue", "note", issue, "-m", body]
-    repo = str(config.get("repo") or "").strip()
-    if repo:
-        cmd += ["--repo", repo]
     try:
+        if not folder.is_dir():
+            return 0
+        body = format_comment(event, report, text)
+        config = load_config(folder)
+        issue = str(config.get("issue") or "").strip()
+        if not issue:
+            _append_pending(folder, event, body)
+            return 0
+        cmd = ["glab", "issue", "note", issue, "-m", body]
+        repo = str(config.get("repo") or "").strip()
+        if repo:
+            cmd += ["--repo", repo]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        _append_pending(folder, event, body)
+        if result.returncode != 0:
+            _append_pending(folder, event, body)
+            return 0
         return 0
-    if result.returncode != 0:
-        _append_pending(folder, event, body)
+    except Exception:
+        # Last resort: a malformed report or an unwritable folder must never
+        # break the pipeline (spec edge case "glab/falha não derruba a wave").
+        try:
+            _append_pending(folder, event, f"(fallback) {event} — comentário não pôde ser formado/enviado")
+        except Exception:
+            pass
         return 0
-    return 0
