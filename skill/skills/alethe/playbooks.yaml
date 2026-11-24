@@ -22,6 +22,14 @@ principles:
 
 providers: [claude, codex]
 
+adapters:
+  opencode:
+    command: opencode
+    args: ["run"]
+    promptTransport: stdin
+    outputFormat: text
+    checked: true
+
 tiers:
   cheap:
     claude: { model: haiku, effort: low }
@@ -166,6 +174,56 @@ playbooks:
             use: { tier: standard, effort: high }
           - if: claude-low
             use: { provider: codex, effort: xhigh }
+
+  handoff-spec-review:
+    name: NDS Handoff Spec → Review
+    goal: Sequential spec-first pipeline with a mandatory human gate and GitLab write-back.
+    pickWhen: "The NDS standard process: every task goes planner → spec validator → human gate → TDD executor → reviewer."
+    avoidWhen: A task that is not going through spec approval (use complete instead).
+    # provider: opencode (planner) and provider: agy (executor) are omitted as fields: both
+    # validators require a phase provider to be in `providers`, which tests pin to [claude, codex]
+    # (test_pick_output... / test_profile_provider_order...). Wave CLIs: references/nds-runbook.md.
+    phases:
+      - id: planner
+        role: planner
+        who: lead
+        tier: cheap
+        readOnly: false
+        does: Read the requirement; write docs/superpowers/specs/YYYY-MM-DD-<feature>-design.md and docs/superpowers/plans/YYYY-MM-DD-<feature>.md with brainstorming and writing-plans.
+        returns: Paths of the spec and plan files.
+        gate: Both files exist and the plan has checkboxes with explicit tests.
+      - id: validator
+        role: spec validator
+        provider: claude
+        tier: strong
+        model: opus
+        effort: high
+        runner: economy
+        readOnly: true
+        does: Check the spec against references/nds-spec-matrix.md, all five categories, rejecting "cumprir tabela" sections.
+        returns: APROVADO, or the failing categories with the reason.
+        gate: 'Record the result before moving on: run `orchestrate.py spec rejected --in current --text "<failures>"` or `orchestrate.py spec approved --in current`. On rejection send the brief back to the planner (maximum 2 rejections; the tool aborts on the third).'
+      - id: executor
+        role: executor
+        tier: standard
+        model: gemini-3.7-pro
+        runner: economy
+        readOnly: false
+        isolate: false
+        does: Execute the plan with strict TDD (test, watch it fail, minimal code, pass), atomic commits, tick the plan checkboxes.
+        returns: Commits made, checks run, failures and risks.
+        gate: The wave only starts with `run --gate-before executor-approval`; the human must approve.
+      - id: reviewer
+        role: reviewer
+        provider: claude
+        tier: strong
+        model: opus
+        effort: high
+        runner: economy
+        readOnly: true
+        does: Run the real test suite and linter, diff against the approved spec, write docs/superpowers/reviews/YYYY-MM-DD-<feature>-review.md (Strengths / Issues Critical-Important-Minor with file:line / Recommendations / Assessment).
+        returns: Ready to merge, or the pending issues.
+        gate: Tests were really executed (never a visual read), and the review file exists.
 
   direct:
     name: Direct
