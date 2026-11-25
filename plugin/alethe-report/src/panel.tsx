@@ -2,9 +2,13 @@
 import {
   atom,
   Button,
+  Callout,
   EmptyState,
   Heading,
+  IconButton,
   Input,
+  List,
+  ListItem,
   plugin,
   read,
   Row,
@@ -13,10 +17,19 @@ import {
   Text,
   update
 } from 'orca'
-import type { IssueItem, IssueList, ReportList, SetupResult, StartResult } from './reports'
+import type {
+  AssessItem,
+  AssessResult,
+  IssueItem,
+  IssueList,
+  ReportList,
+  SetupResult,
+  StartResult,
+  WaveList
+} from './reports'
 
 /** What the empty and error states show: the new flow's first step, never a shell command. */
-const INSTRUCTION = 'Sem relatórios ainda — escreva a tarefa acima e clique em 🚀 Orquestrar tarefa.'
+const INSTRUCTION = 'Sem relatórios ainda — escreva a tarefa acima e clique em Orquestrar tarefa.'
 
 /** The panel's states: what one `list-reports` answer (or its failure) becomes. */
 export type PanelState =
@@ -61,10 +74,41 @@ export async function loadIssues(req: () => Promise<IssueList>): Promise<IssuesS
   }
 }
 
+/**
+ * Pure: maps one `list-waves` answer to the section's state, with the request function
+ * injected (same shape as `load` and `loadIssues`). A rejected request — or the worker's own
+ * `error` — lands here as data: an unreadable proposal is a small note, never a broken frame.
+ */
+export async function loadWaves(req: () => Promise<WaveList>): Promise<WaveList> {
+  try {
+    const answer = await req()
+    return { waves: answer?.waves ?? [], error: answer?.error }
+  } catch (err) {
+    return { waves: [], error: String(err) }
+  }
+}
+
+/** What the "Avaliação" section draws: the items of the last `assess`, or nothing yet. */
+export type AssessmentState = { ok: boolean; items: AssessItem[] } | null
+
 /** The state drawn now; `loading` until the first answer arrives. */
 const state = atom<PanelState>({ kind: 'loading' })
 /** The "Issues abertas" section's state; `issues` empty until the first answer arrives. */
 const issuesState = atom<IssuesState>({ issues: [] })
+/** The "Proposta de waves" section's state; empty until the first answer arrives. */
+const wavesState = atom<WaveList>({ waves: [] })
+/** The last "Avaliar projeto" answer; `null` until the first press. */
+const assessmentState = atom<AssessmentState>(null)
+/** Whether an assessment is in flight, so one click cannot start a second. */
+const assessBusy = atom(false)
+/** What the last "Propor waves" press answered, inline under the assessment. */
+const proposeNote = atom<{ text: string; tone: 'success' | 'danger' } | null>(null)
+/** Whether a proposal dispatch is in flight, so one click cannot start a second. */
+const proposeBusy = atom(false)
+/** What the last "Executar wave" press answered, inline under the proposal. */
+const execNote = atom<{ text: string; tone: 'success' | 'danger' } | null>(null)
+/** Whether a wave dispatch is in flight, so one click cannot start a second. */
+const execBusy = atom(false)
 /** What the last "Abrir" press answered, inline feedback by report path. */
 const notes = atom<Record<string, { text: string; tone: 'success' | 'danger' }>>({})
 /** One "Preparar e gerar" answer, inline above the list (or the empty state); `null` when none. */
@@ -77,20 +121,36 @@ const taskText = atom('')
 const startNote = atom<{ text: string; tone: 'success' | 'danger' } | null>(null)
 /** Whether an agent dispatch is in flight, so one click cannot start a second. */
 const startBusy = atom(false)
-/** One issue-row 🚀 answer, keyed by the issue it belongs to; `null` when none. */
+/** One issue-row dispatch answer, keyed by the issue it belongs to; `null` when none. */
 const issueNote = atom<{ number: number; text: string; tone: 'success' | 'danger' } | null>(null)
 /** Whether an issue dispatch is in flight, so one click cannot start a second. */
 const issueBusy = atom(false)
 
+/** The note a started proposal shows: the leader takes minutes, so there is no polling. */
+const PROPOSING_NOTE =
+  'Proposta sendo gerada pelo leader alethe — clique em Recarregar em alguns minutos.'
+
+/** How each assessment state is drawn: tone and icon of the Callout carrying the item. */
+const CALLOUT_STYLE: Record<
+  AssessItem['state'],
+  { tone: 'success' | 'warning' | 'danger'; icon: 'check' | 'warning' | 'error' }
+> = {
+  ok: { tone: 'success', icon: 'check' },
+  warn: { tone: 'warning', icon: 'warning' },
+  fail: { tone: 'danger', icon: 'error' }
+}
+
 /** One list request end to end; `load` turns any failure into the error state. */
 async function refresh(): Promise<void> {
-  // Both lists, in parallel: a failure in one lands as data and never blocks the other.
-  const [reports, issues] = await Promise.all([
+  // All three lists, in parallel: a failure in one lands as data and never blocks the others.
+  const [reports, issues, waves] = await Promise.all([
     load(() => plugin.request('list-reports')),
-    loadIssues(() => plugin.request('list-issues'))
+    loadIssues(() => plugin.request('list-issues')),
+    loadWaves(() => plugin.request('list-waves'))
   ])
   set(state, reports)
   set(issuesState, issues)
+  set(wavesState, waves)
 }
 
 /**
@@ -107,9 +167,8 @@ export async function runSetup(req: () => Promise<SetupResult>): Promise<SetupRe
 }
 
 /**
- * Pure: one `start-task` answer, with the request function injected so the seam tests without a
- * host (same shape as `load` and `runSetup`). A rejected request becomes `failed` data — the
- * frame never sees an exception.
+ * Pure: one `start-task` answer, with the request function injected (same shape as `load` and
+ * `runSetup`). A rejected request becomes `failed` data — the frame never sees an exception.
  */
 export async function runStart(req: () => Promise<StartResult>): Promise<StartResult> {
   try {
@@ -132,7 +191,44 @@ export async function runStartIssue(req: () => Promise<StartResult>): Promise<St
 }
 
 /**
- * The "🚀 Orquestrar tarefa" press: one click that opens the live agent terminal with the
+ * Pure: one `assess` answer, with the request function injected (same shape as `load`). A
+ * rejected request becomes one `fail` item — the frame never sees an exception, and the
+ * section still draws what went wrong.
+ */
+export async function runAssess(req: () => Promise<AssessResult>): Promise<AssessResult> {
+  try {
+    return await req()
+  } catch (err) {
+    return { ok: false, items: [{ label: 'avaliação', state: 'fail', detail: String(err) }] }
+  }
+}
+
+/**
+ * Pure: one `propose-waves` answer, with the request function injected (same shape as
+ * `runStart`). A rejected request becomes `failed` data — the frame never sees an exception.
+ */
+export async function runPropose(req: () => Promise<StartResult>): Promise<StartResult> {
+  try {
+    return await req()
+  } catch (err) {
+    return { status: 'failed', detail: String(err) }
+  }
+}
+
+/**
+ * Pure: one `execute-wave` answer, with the request function injected (same shape as
+ * `runStart`). A rejected request becomes `failed` data — the frame never sees an exception.
+ */
+export async function runExecuteWave(req: () => Promise<StartResult>): Promise<StartResult> {
+  try {
+    return await req()
+  } catch (err) {
+    return { status: 'failed', detail: String(err) }
+  }
+}
+
+/**
+ * The "Orquestrar tarefa" press: one click that opens the live agent terminal with the
  * alethe kickoff, so the person never has to know that `/alethe` is an agent command rather
  * than a shell one. `started` clears the field (the task now belongs to the terminal); every
  * outcome lands as an inline note — never a thrown exception — and the note is reset on the
@@ -155,7 +251,7 @@ async function start(): Promise<void> {
 }
 
 /**
- * One issue row's "🚀" press: `start-issue` for THAT row, with the same atom discipline as
+ * One issue row's dispatch press: `start-issue` for THAT row, with the same atom discipline as
  * `start` (busy guard, note reset on the next click). Every outcome lands as an inline note
  * under the row — never a thrown exception — and the manual field below stays as the fallback.
  */
@@ -177,6 +273,53 @@ async function startFromIssue(issue: IssueItem): Promise<void> {
   }
 }
 
+/** The "Avaliar projeto" press: one zero-token `assess`; the items land as Callouts. */
+async function runAssessment(): Promise<void> {
+  if (read(assessBusy)) return
+  set(assessBusy, true)
+  try {
+    const result = await runAssess(() => plugin.request('assess'))
+    set(assessmentState, { ok: result.ok, items: result.items ?? [] })
+  } finally {
+    set(assessBusy, false)
+  }
+}
+
+/**
+ * The "Propor waves" press (shown only after a ready assessment): ONE dispatch of the alethe
+ * leader, which saves the proposal without executing anything. The leader runs for minutes,
+ * so the note tells the person to hit Recarregar later — no polling, ever.
+ */
+async function proposeWavesAction(): Promise<void> {
+  if (read(proposeBusy)) return
+  set(proposeBusy, true)
+  set(proposeNote, null)
+  try {
+    const result = await runPropose(() => plugin.request('propose-waves'))
+    set(
+      proposeNote,
+      result.status === 'started'
+        ? { text: PROPOSING_NOTE, tone: 'success' }
+        : { text: result.detail, tone: 'danger' }
+    )
+  } finally {
+    set(proposeBusy, false)
+  }
+}
+
+/** One wave's play press: `execute-wave` for THAT approved wave, note under the proposal. */
+async function executeWaveAction(wave: number): Promise<void> {
+  if (read(execBusy)) return
+  set(execBusy, true)
+  set(execNote, null)
+  try {
+    const result = await runExecuteWave(() => plugin.request('execute-wave', { wave }))
+    set(execNote, { text: result.detail, tone: result.status === 'started' ? 'success' : 'danger' })
+  } finally {
+    set(execBusy, false)
+  }
+}
+
 /**
  * The "Preparar e gerar relatório" press: one click that installs alethe if missing and writes
  * report.html. A `generated` answer is followed by `open-report` (the panel's own way of showing
@@ -190,16 +333,16 @@ async function prepare(): Promise<void> {
   try {
     const result = await runSetup(() => plugin.request('setup-report'))
     if (result.status === 'generated' && result.path) {
-      let text = 'Relatório gerado e aberto ✓'
+      let text = 'Relatório gerado e aberto'
       let tone: 'success' | 'danger' = 'success'
       try {
         const open = await plugin.request('open-report', { path: result.path })
         if (!open.opened) {
-          text = `Relatório gerado ✓ — ${open.error ?? 'não foi possível abrir'}`
+          text = `Relatório gerado — ${open.error ?? 'não foi possível abrir'}`
           tone = 'danger'
         }
       } catch (err) {
-        text = `Relatório gerado ✓ — ${String(err)}`
+        text = `Relatório gerado — ${String(err)}`
         tone = 'danger'
       }
       set(setupNote, { text, tone })
@@ -259,6 +402,13 @@ function contextOf(path: string): string {
 export default function Panel() {
   const current = read(state)
   const issueList = read(issuesState)
+  const waveList = read(wavesState)
+  const assessment = read(assessmentState)
+  const assessing = read(assessBusy)
+  const proposing = read(proposeBusy)
+  const proposalNote = read(proposeNote)
+  const executing = read(execBusy)
+  const executionNote = read(execNote)
   const allNotes = read(notes)
   const note = read(setupNote)
   const busy = read(setupBusy)
@@ -267,19 +417,13 @@ export default function Panel() {
   const dispatchNote = read(startNote)
   const rowNote = read(issueNote)
   const issueStarting = read(issueBusy)
-  /** The one-click setup button; hidden while loading, drawn where a stale or absent list needs it. Secondary to the dispatch button below. */
-  const prepareButton = (size?: 'sm') => (
-    <Button
-      size={size ?? 'md'}
-      variant="outline"
-      disabled={busy}
-      onPress={prepare}
-    >
-      ⚙️ Preparar e gerar relatório
+  /** The one-click setup button: the LAST control of the panel, secondary to the dispatch one. */
+  const prepareButton = (
+    <Button variant="outline" icon="settings" disabled={busy} onPress={prepare}>
+      Preparar e gerar relatório
     </Button>
   )
-  /** The task field + dispatch button: the first step without friction (empty state only — a
-   *  ready state already has its report, so `Recarregar` suffices there). */
+  /** The task field + dispatch button: the first step without friction, always available. */
   const dispatchRow = (
     <Row gap="sm" align="end">
       <Input
@@ -291,10 +435,11 @@ export default function Panel() {
       />
       <Button
         variant="solid"
+        icon="rocket"
         disabled={starting || task.trim() === ''}
         onPress={start}
       >
-        🚀 Orquestrar tarefa
+        Orquestrar tarefa
       </Button>
     </Row>
   )
@@ -302,12 +447,9 @@ export default function Panel() {
     <Stack gap="md">
       <Row justify="between" align="center">
         <Heading level={2}>Alethe Reports</Heading>
-        <Row gap="sm" align="center">
-          {current.kind === 'ready' && prepareButton('sm')}
-          <Button size="sm" variant="ghost" icon="refresh" onPress={reload}>
-            Recarregar
-          </Button>
-        </Row>
+        <Button size="sm" variant="ghost" icon="refresh" onPress={reload}>
+          Recarregar
+        </Button>
       </Row>
       {note && (
         <Text size="sm" tone={note.tone}>
@@ -352,15 +494,87 @@ export default function Panel() {
               {current.message}
             </Text>
           )}
-          {current.kind === 'empty' && dispatchNote && (
-            <Text size="sm" tone={dispatchNote.tone}>
-              {dispatchNote.text}
-            </Text>
-          )}
-          {current.kind === 'empty' && dispatchRow}
-          {prepareButton()}
           <EmptyState title="Nenhum relatório" description={current.instruction} icon="file-text" />
         </Stack>
+      )}
+      {/* Avaliação: um clique zero-token; os itens viram Callouts, e um ambiente pronto
+          libera o botão que despacha o leader para propor as waves. */}
+      <Stack gap="sm">
+        <Heading level={3}>Avaliação</Heading>
+        <Row gap="sm" wrap>
+          <Button
+            size="sm"
+            variant="outline"
+            icon="search"
+            disabled={assessing || proposing}
+            onPress={runAssessment}
+          >
+            Avaliar projeto
+          </Button>
+          {assessment?.ok && (
+            <Button size="sm" variant="solid" icon="zap" disabled={proposing} onPress={proposeWavesAction}>
+              Propor waves
+            </Button>
+          )}
+        </Row>
+        {assessment && (
+          <Stack gap="sm">
+            {assessment.items.map((item) => (
+              <Callout
+                key={item.label}
+                tone={CALLOUT_STYLE[item.state].tone}
+                icon={CALLOUT_STYLE[item.state].icon}
+                title={item.label}
+              >
+                <Text size="sm">{item.detail}</Text>
+              </Callout>
+            ))}
+          </Stack>
+        )}
+        {proposalNote && (
+          <Text size="sm" tone={proposalNote.tone}>
+            {proposalNote.text}
+          </Text>
+        )}
+      </Stack>
+      {/* Proposta de waves: some quando não há proposta (sem ruído), e vira uma nota pequena
+          quando ela não pôde ser lida — a lista de relatórios segue funcionando. */}
+      {waveList.waves.length > 0 && (
+        <Stack gap="sm">
+          <Heading level={3}>Proposta de waves</Heading>
+          <List>
+            {waveList.waves.map((wave) => {
+              const meta = [wave.estimate, wave.playbook]
+                .filter((value): value is string => typeof value === 'string' && value !== '')
+                .join(' · ')
+              return (
+                <ListItem
+                  key={wave.id}
+                  title={`Wave ${wave.id} · ${wave.title} · issues ${wave.issues.join(', ')}`}
+                  description={meta === '' ? undefined : meta}
+                  icon="layers"
+                >
+                  <IconButton
+                    icon="play"
+                    label={`Executar wave ${wave.id}`}
+                    disabled={executing}
+                    onPress={() => executeWaveAction(wave.id)}
+                  />
+                </ListItem>
+              )
+            })}
+          </List>
+          {executionNote && (
+            <Text size="sm" tone={executionNote.tone}>
+              {executionNote.text}
+            </Text>
+          )}
+        </Stack>
+      )}
+      {waveList.error && (
+        <Text size="xs" muted>
+          {waveList.error}
+        </Text>
       )}
       {/* Issues abertas: a seção existe só com issues; a falha do fetch vira uma nota
           pequena e não destrutiva na mesma área — o painel segue funcionando. */}
@@ -390,14 +604,12 @@ export default function Panel() {
                         </Text>
                       )}
                     </Stack>
-                    <Button
-                      size="sm"
-                      variant="outline"
+                    <IconButton
+                      icon="rocket"
+                      label={`Orquestrar issue #${issue.number}`}
                       disabled={issueStarting}
                       onPress={() => startFromIssue(issue)}
-                    >
-                      🚀
-                    </Button>
+                    />
                   </Row>
                 )
               })}
@@ -405,6 +617,14 @@ export default function Panel() {
           )}
         </Stack>
       )}
+      {/* Tarefa manual: o caminho sem atrito, sempre disponível (fallback das seções acima). */}
+      {dispatchNote && (
+        <Text size="sm" tone={dispatchNote.tone}>
+          {dispatchNote.text}
+        </Text>
+      )}
+      {dispatchRow}
+      {prepareButton}
     </Stack>
   )
 }

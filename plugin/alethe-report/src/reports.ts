@@ -49,6 +49,9 @@ const ORCHESTRATIONS = '~/.config/alethe/orchestrations'
 /** Where the alethe skill is installed (or cloned to), relative to the home directory. */
 const ALETHE_SKILL = '~/.agents/skills/alethe'
 
+/** Where the leader saves its wave proposals, relative to the home directory. */
+const ALETHE_PROPOSALS = '~/.config/alethe/proposals'
+
 /**
  * `ls -t` sorts its arguments newest-first; `{} +` batches so the sort stays global across
  * batches at our scale. Portable: works with BSD/macOS and GNU find alike.
@@ -295,16 +298,25 @@ export function parseSetupWrite(output: string): boolean {
 /** What the panel shows when there is nothing to report yet — the NEW flow's first step, never
  *  a shell hint: base sentence for a machine without the skill yet… */
 const NO_TASKS =
-  'Nenhuma tarefa orquestrada ainda — escreva uma tarefa no campo e clique em 🚀 Orquestrar tarefa. (O comando /alethe roda dentro da conversa de um agente, não no shell.)'
+  'Nenhuma tarefa orquestrada ainda — escreva uma tarefa no campo e clique em Orquestrar tarefa. (O comando /alethe roda dentro da conversa de um agente, não no shell.)'
 /** …and the same sentence after this very call installed the skill (prefix stays verbatim). */
-const INSTALLED_NO_TASKS = `Alethe instalado ✓ — ${NO_TASKS}`
+const INSTALLED_NO_TASKS = `Alethe instalado — ${NO_TASKS}`
 const INSTALL_FAILED_DETAIL =
   'Falha ao instalar o alethe (git clone). Confira sua autenticação GitHub (gh auth login) e tente de novo.'
 /** The check itself could not be read — a different failure from a clone that refused. */
 const CHECK_FAILED_DETAIL = 'Não foi possível verificar se o alethe está instalado.'
 
 /** Bounded polls per step: a local `test` answers at once, a clone and a render take longer. */
-const STEP_DEADLINES = { check: 15_000, install: 120_000, folder: 15_000, write: 180_000, issues: 30_000 }
+const STEP_DEADLINES = {
+  check: 15_000,
+  install: 120_000,
+  folder: 15_000,
+  write: 180_000,
+  issues: 30_000,
+  doctor: 30_000,
+  forge: 10_000,
+  waves: 15_000
+}
 
 /**
  * Runs one step's command in its own ephemeral terminal and returns its output, polling until
@@ -424,13 +436,222 @@ export async function setupReport(host: Host): Promise<SetupResult> {
         status: 'generated',
         installed,
         path: `${folder}/report.html`,
-        detail: 'Relatório gerado ✓'
+        detail: 'Relatório gerado'
       }
     }
     return { status: 'failed', installed, detail: `orchestrate.py report falhou em ${folder}` }
   } catch (err) {
     return { status: 'failed', installed, detail: String(err) }
   }
+}
+
+// --- assess: a avaliação interna do ambiente — zero tokens, itens como dados. ---
+//
+// Três passos em terminais efêmeros (cada um fechado no `finally` do `runStep`): o
+// `ensureAlethe` compartilhado, o `doctor` do orchestrate.py e o `auth` de cada forge. O
+// doctor vem COMPACTO (`tr -d '\n'`) — a mesma lição do pretty-PTY das issues — e a fonte dos
+// comandos nunca carrega um marcador completo (quebrado com `""`), para o eco do PTY não casar
+// com o resultado.
+
+/** `assess`'s answer: the environment verdict, item by item, as data — never an exception. */
+export type AssessItem = { label: string; state: 'ok' | 'warn' | 'fail'; detail: string }
+
+/** `assess`'s answer: whether the environment is ready (alethe + python + ≥1 CLI) and how. */
+export type AssessResult = {
+  ok: boolean
+  items: AssessItem[]
+}
+
+/** Step 2: the skill's own doctor, one line of JSON plus the flow marker. */
+export function doctorCommand(): string {
+  return (
+    `python3 ${ALETHE_SKILL}/scripts/orchestrate.py doctor 2>/dev/null | tr -d '\\n'; ` +
+    'echo DOCTOR""_DONE'
+  )
+}
+
+/** Step 3a: GitHub auth, told apart by two markers the source never spells whole. */
+export function githubAuthCommand(): string {
+  return 'gh auth status >/dev/null 2>&1 && echo GH""_OK || echo GH""_FAIL'
+}
+
+/** Step 3b: GitLab auth, same discipline as step 3a. */
+export function gitlabAuthCommand(): string {
+  return 'glab auth status >/dev/null 2>&1 && echo GLAB""_OK || echo GLAB""_FAIL'
+}
+
+/** What `parseDoctorOutput` derives from the doctor's JSON, ready to draw. */
+export type DoctorInfo = {
+  pythonOk: boolean
+  pythonDetail: string
+  /** The provider CLIs found on PATH (`installedProviders`). */
+  clis: string[]
+  /** Providers flagged `missing`/`blocked` — or installed but not logged in. */
+  blocked: string[]
+}
+
+/** Names out of the doctor's provider lists: strings, or objects with a provider/name/id. */
+function toNames(value: unknown): string[] {
+  if (typeof value === 'string') return value.trim() === '' ? [] : [value.trim()]
+  if (!Array.isArray(value)) return []
+  const names: string[] = []
+  for (const entry of value) {
+    const name =
+      typeof entry === 'string'
+        ? entry
+        : typeof entry === 'object' && entry !== null
+          ? String((entry as Record<string, unknown>).provider ?? (entry as Record<string, unknown>).name ?? '')
+          : ''
+    if (name.trim() !== '') names.push(name.trim())
+  }
+  return names
+}
+
+/** Whether one doctor provider entry is an auth/quota problem. */
+function isAuthProblem(entry: unknown): boolean {
+  if (typeof entry !== 'object' || entry === null) return false
+  const record = entry as Record<string, unknown>
+  if (record.missing === true || record.blocked === true) return true
+  // The real `doctor_payload` speaks `loggedIn`: false means "installed but not logged in",
+  // null means "not installed" (never an auth problem by itself).
+  return record.loggedIn === false
+}
+
+/**
+ * Reads the doctor's JSON out of its (compact) output: first `{` to last `}` — the command
+ * source carries no braces, so the echoed line can never be mistaken for the payload. Any
+ * failure — no braces, broken JSON, a non-object — answers `null`, never a throw.
+ */
+export function parseDoctorOutput(output: string): DoctorInfo | null {
+  const start = output.indexOf('{')
+  const end = output.lastIndexOf('}')
+  if (start === -1 || end <= start) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(output.slice(start, end + 1))
+  } catch {
+    return null
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null
+  const record = parsed as Record<string, unknown>
+
+  const python = record.python
+  let pythonOk = false
+  let pythonDetail = 'python não encontrado'
+  if (typeof python === 'boolean') {
+    pythonOk = python
+    pythonDetail = python ? 'python ok' : 'python 3.9 ou mais recente'
+  } else if (typeof python === 'string' && python.trim() !== '') {
+    pythonOk = true
+    pythonDetail = `python ${python.trim()}`
+  } else if (typeof python === 'object' && python !== null) {
+    const info = python as Record<string, unknown>
+    const version = typeof info.version === 'string' ? info.version : ''
+    pythonOk = info.ok === true || (typeof info.ok !== 'boolean' && version !== '')
+    pythonDetail = pythonOk ? (version === '' ? 'python ok' : `python ${version}`) : 'python 3.9 ou mais recente'
+  }
+
+  const clis = toNames(record.installedProviders)
+  const blocked: string[] = []
+  if (Array.isArray(record.providers)) {
+    for (const entry of record.providers) {
+      if (isAuthProblem(entry)) {
+        const name = toNames([entry])[0] ?? ''
+        if (name !== '' && !blocked.includes(name)) blocked.push(name)
+      }
+    }
+  }
+  return { pythonOk, pythonDetail, clis, blocked }
+}
+
+/** One forge's auth verdict as an item; a refused step is data, never a throw. */
+async function forgeItem(
+  host: Host,
+  label: string,
+  command: string,
+  markers: readonly string[],
+  okMarker: string,
+  okDetail: string,
+  failDetail: string
+): Promise<AssessItem> {
+  try {
+    const output = await runStep(host, `alethe-report: ${label}`, command, markers, STEP_DEADLINES.forge)
+    return {
+      label,
+      state: lastMarker(output, markers) === okMarker ? 'ok' : 'fail',
+      detail: lastMarker(output, markers) === okMarker ? okDetail : failDetail
+    }
+  } catch (err) {
+    return { label, state: 'fail', detail: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/**
+ * The panel's "Avaliar projeto": one zero-token pass over the machine — is the skill ready,
+ * does the doctor answer (python, provider CLIs, auth/quota) and is each forge authenticated.
+ * Overall `ok` is alethe + python + ≥1 CLI: a forge without auth is a `fail` ITEM, never a
+ * reason to block the proposal flow (projects differ in which forge they use).
+ */
+export async function assess(host: Host): Promise<AssessResult> {
+  let ensured: EnsureResult
+  try {
+    ensured = await ensureAlethe(host)
+  } catch (err) {
+    return {
+      ok: false,
+      items: [{ label: 'alethe', state: 'fail', detail: err instanceof Error ? err.message : String(err) }]
+    }
+  }
+  if (!ensured.ok) return { ok: false, items: [{ label: 'alethe', state: 'fail', detail: ensured.detail }] }
+
+  const items: AssessItem[] = [{ label: 'alethe', state: 'ok', detail: 'skill + runner prontos' }]
+  let ready = true
+  let info: DoctorInfo | null = null
+  try {
+    const output = await runStep(
+      host,
+      'alethe-report: doctor',
+      doctorCommand(),
+      ['DOCTOR_DONE'],
+      STEP_DEADLINES.doctor
+    )
+    info = parseDoctorOutput(output)
+  } catch {
+    info = null
+  }
+  if (info === null) {
+    // One fail item instead of the three the doctor would have produced.
+    items.push({ label: 'doctor', state: 'fail', detail: 'doctor não respondeu' })
+    ready = false
+  } else {
+    items.push({ label: 'python', state: info.pythonOk ? 'ok' : 'fail', detail: info.pythonDetail })
+    items.push({
+      label: 'CLIs',
+      state: info.clis.length > 0 ? 'ok' : 'warn',
+      detail: info.clis.length > 0 ? info.clis.join(', ') : 'nenhum'
+    })
+    items.push({
+      label: 'auth/quota',
+      state: info.blocked.length > 0 ? 'warn' : 'ok',
+      detail: info.blocked.length > 0 ? `faltando: ${info.blocked.join(', ')}` : 'nenhum bloqueado'
+    })
+    if (!info.pythonOk || info.clis.length === 0) ready = false
+  }
+  items.push(
+    await forgeItem(host, 'github', githubAuthCommand(), ['GH_OK', 'GH_FAIL'], 'GH_OK', 'gh autenticado', 'gh sem autenticação')
+  )
+  items.push(
+    await forgeItem(
+      host,
+      'gitlab',
+      gitlabAuthCommand(),
+      ['GLAB_OK', 'GLAB_FAIL'],
+      'GLAB_OK',
+      'glab autenticado',
+      'glab sem autenticação'
+    )
+  )
+  return { ok: ready, items }
 }
 
 // --- list-issues: as issues abertas do projeto, de qualquer forge. ---
@@ -602,7 +823,7 @@ export async function dispatchAgent(
     return {
       status: 'started',
       detail:
-        'Agente iniciado ✓ — acompanhe o terminal; o relatório aparecerá aqui quando as waves concluírem.'
+        'Agente iniciado — acompanhe o terminal; o relatório aparecerá aqui quando as waves concluírem.'
     }
   } catch (err) {
     // `err.message` rather than `String(err)`, so "nenhum workspace focado" reaches the panel
@@ -625,7 +846,7 @@ export async function startTask(host: Host, task: string): Promise<StartResult> 
 }
 
 /**
- * Dispatches the alethe agent for one ISSUE (the panel's "Issues abertas" 🚀): validate the
+ * Dispatches the alethe agent for one ISSUE (the panel's "Issues abertas" button): validate the
  * row, then the same `dispatchAgent` as `start-task` — no duplicated command strings. The
  * kickoff asks for the dry-run and holds for approval, the flow the user chose: alethe
  * previews the waves and "goal alone is not approval". The agent terminal is NEVER closed.
@@ -640,4 +861,145 @@ export async function startIssue(
   }
   const title = `alethe #${issue.number} ${issue.title.slice(0, 30)}`
   return dispatchAgent(host, issueKickoffOf(issue), title)
+}
+
+// --- avaliação → proposta de waves → execução, tudo pelo painel. ---
+//
+// `propose-waves` e `execute-wave` usam o MESMO `dispatchAgent` do start-task/start-issue
+// (terminal de agente nunca fechado); `list-waves` lê o arquivo que o leader salvou num
+// terminal efêmero só, fechado no `finally`.
+
+/** `list-waves`' answer: the proposal's waves (normalized), or why they could not be read. */
+export type WaveItem = { id: number; title: string; issues: number[]; playbook?: string; estimate?: string }
+
+/** `list-waves`' answer as the panel draws it: never an exception. */
+export type WaveList = { waves: WaveItem[]; error?: string }
+
+/** The message every unreadable proposal answers with — data, never a throw. */
+const WAVE_PARSE_ERROR = 'não consegui ler a proposta de waves'
+
+/**
+ * One ephemeral command: the NEWEST proposal under `~/.config/alethe/proposals`, compacted
+ * to a single line (the pretty-PTY lesson again), between the two broken markers. The source
+ * carries NO braces — the payload is an object, so "first `{` to last `}`" over the output
+ * can only ever find the real JSON, echo included.
+ */
+export function wavesCommand(): string {
+  return (
+    `f=$(ls -t ${ALETHE_PROPOSALS}/*.json 2>/dev/null | head -1); ` +
+    'if [ -z "$f" ]; then echo NO""_PROPOSAL; else cat "$f" | tr -d \'\\n\'; fi; ' +
+    'echo WAVES""_DONE'
+  )
+}
+
+/**
+ * Normalizes ONE wave of the leader's proposal: `id` coerced to a finite number, `title` a
+ * non-empty string, `issues` an array of finite numbers — anything malformed is DROPPED
+ * (same philosophy as `normalizeWave`'s sibling `normalizeIssue`: a row the panel could not
+ * draw is not a row to show), and this function never throws.
+ */
+export function normalizeWave(raw: unknown): WaveItem | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const record = raw as Record<string, unknown>
+  const rawId = record.id
+  if (rawId === null || rawId === undefined) return undefined
+  const id = typeof rawId === 'number' ? rawId : typeof rawId === 'string' && rawId.trim() !== '' ? Number(rawId) : NaN
+  if (!Number.isFinite(id)) return undefined
+  if (typeof record.title !== 'string' || record.title.trim() === '') return undefined
+  if (!Array.isArray(record.issues)) return undefined
+  const issues: number[] = []
+  for (const entry of record.issues) {
+    if (typeof entry !== 'number' && typeof entry !== 'string') continue
+    if (typeof entry === 'string' && entry.trim() === '') continue
+    const number = typeof entry === 'number' ? entry : Number(entry)
+    if (Number.isFinite(number)) issues.push(number)
+  }
+  const wave: WaveItem = { id, title: record.title, issues }
+  if (typeof record.playbook === 'string' && record.playbook !== '') wave.playbook = record.playbook
+  if (typeof record.estimate === 'string' && record.estimate !== '') wave.estimate = record.estimate
+  return wave
+}
+
+/**
+ * Reads `wavesCommand`'s output: `NO_PROPOSAL` → an empty list with NO error (a panel that
+ * has no proposal yet is not a broken panel); otherwise the first `{` to last `}` — the
+ * command source carries no braces, so the echoed line never enters the slice. Every other
+ * failure (broken JSON, `waves` that is not an array) is an `error` as data.
+ */
+export function parseWavesOutput(output: string): WaveList {
+  if (lastMarker(output, ['NO_PROPOSAL']) !== undefined) return { waves: [] }
+  const start = output.indexOf('{')
+  const end = output.lastIndexOf('}')
+  if (start === -1 || end <= start) return { waves: [], error: WAVE_PARSE_ERROR }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(output.slice(start, end + 1))
+  } catch {
+    return { waves: [], error: WAVE_PARSE_ERROR }
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { waves: [], error: WAVE_PARSE_ERROR }
+  }
+  const waves = (parsed as Record<string, unknown>).waves
+  if (!Array.isArray(waves)) return { waves: [], error: WAVE_PARSE_ERROR }
+  return {
+    waves: waves
+      .map(normalizeWave)
+      .filter((wave): wave is WaveItem => wave !== undefined)
+  }
+}
+
+/**
+ * Lists the saved proposal's waves in ONE ephemeral terminal (closed in `runStep`'s
+ * `finally`). Every failure — no workspace, a refused create, an unreadable file — comes
+ * back as a `WaveList` with `error`, never thrown.
+ */
+export async function listWaves(host: Host): Promise<WaveList> {
+  try {
+    const output = await runStep(
+      host,
+      'alethe-report: waves',
+      wavesCommand(),
+      ['WAVES_DONE'],
+      STEP_DEADLINES.waves
+    )
+    return parseWavesOutput(output)
+  } catch (err) {
+    return { waves: [], error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/** The one dispatch `propose-waves` runs: evaluate, prioritize, group issues, SAVE, execute nothing. */
+export const PROPOSE_KICKOFF = `Use a skill alethe para AVALIAR este projeto e suas issues abertas, priorizar o que vale executar e montar waves de execução agrupando as issues relacionadas. Salve a proposta em ${ALETHE_PROPOSALS}/<nome-do-repositório>.json (crie o diretório) no formato {"waves":[{"id":1,"title":"...","issues":[58,57],"playbook":"...","estimate":"..."}]}. NÃO execute nenhuma wave — apenas a proposta. Quando terminar, diga "proposta salva".`
+
+/**
+ * Dispatches the alethe leader to PRODUCE the proposal — one dispatch, no input, never a
+ * real run in tests (the panel's own live E2E is the controller's). The agent terminal is
+ * the live session: `dispatchAgent` opens it and never closes it.
+ */
+export async function proposeWaves(host: Host): Promise<StartResult> {
+  return dispatchAgent(host, PROPOSE_KICKOFF, 'alethe: propor waves')
+}
+
+/** The kickoff one APPROVED wave runs: the number, the saved proposal and the NDS runbook. */
+export function executeWaveKickoff(wave: number): string {
+  return (
+    `Use a skill alethe: o usuário APROVOU pelo painel a wave ${wave} da proposta salva em ` +
+    `${ALETHE_PROPOSALS}/. Leia a proposta, monte os briefs dessa wave e execute-a agora ` +
+    '(dry-run interno e depois os workers), seguindo o runbook NDS em ' +
+    '~/.agents/skills/alethe/references/nds-runbook.md.'
+  )
+}
+
+/**
+ * Dispatches the alethe agent for one APPROVED wave: validate the number BEFORE any host
+ * call (an unpicked wave must not reach a terminal at all), then the shared `dispatchAgent`.
+ * The agent terminal is NEVER closed — same rule as `startTask` and `startIssue`.
+ */
+export async function executeWave(host: Host, wave: number): Promise<StartResult> {
+  if (!Number.isFinite(wave) || wave <= 0) {
+    // Before ANY host call: no wave chosen means no terminal at all.
+    return { status: 'failed', detail: 'Escolha uma wave primeiro.' }
+  }
+  return dispatchAgent(host, executeWaveKickoff(wave), `alethe: wave ${wave}`)
 }

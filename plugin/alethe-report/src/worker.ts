@@ -6,19 +6,25 @@
 // deliberately left open.
 import type { OrcaWorkerApi } from 'orca/worker'
 import {
+  assess,
+  executeWave,
   isReportPath,
   listIssues,
   listReports,
+  listWaves,
   openReport,
+  proposeWaves,
   setupReport,
   startIssue,
   startTask,
+  type AssessResult,
   type Host,
   type IssueList,
   type OpenResult,
   type ReportList,
   type SetupResult,
-  type StartResult
+  type StartResult,
+  type WaveList
 } from './reports'
 
 export default function activate(orca: OrcaWorkerApi): void {
@@ -70,8 +76,8 @@ export default function activate(orca: OrcaWorkerApi): void {
     return result
   })
 
-  // One row's 🚀: same shared dispatcher as `start-task` (never closes the agent terminal),
-  // with the issue's kickoff asking for the dry-run and holding for approval.
+  // One row's issue dispatch: same shared dispatcher as `start-task` (never closes the agent
+  // terminal), with the issue's kickoff asking for the dry-run and holding for approval.
   orca.panels.handle('start-issue', async (input): Promise<StartResult> => {
     const issue = {
       number: Number(input?.number ?? 0),
@@ -80,6 +86,38 @@ export default function activate(orca: OrcaWorkerApi): void {
     }
     const result = await startIssue(host, issue)
     if (result.status === 'failed') orca.log(`start-issue: ${result.detail}`)
+    return result
+  })
+
+  // The panel's "Avaliar projeto": zero tokens, ephemeral terminals only — an environment
+  // verdict as items. `ok: false` (skill missing, doctor silent) is logged, never thrown.
+  orca.panels.handle('assess', async (): Promise<AssessResult> => {
+    const result = await assess(host)
+    if (!result.ok) orca.log('assess: ambiente não pronto')
+    return result
+  })
+
+  // The panel's "Propor waves": ONE dispatch of the alethe leader (agent terminal never
+  // closed) that saves the proposal — no wave runs from here, ever.
+  orca.panels.handle('propose-waves', async (): Promise<StartResult> => {
+    const result = await proposeWaves(host)
+    if (result.status === 'failed') orca.log(`propose-waves: ${result.detail}`)
+    return result
+  })
+
+  // The saved proposal, newest file first, one ephemeral terminal closed in `finally`;
+  // an unreadable proposal arrives as `error` data for the panel's small note.
+  orca.panels.handle('list-waves', async (): Promise<WaveList> => {
+    const result = await listWaves(host)
+    if (result.error) orca.log(`list-waves: ${result.error}`)
+    return result
+  })
+
+  // One wave row's play button: the wave number is validated BEFORE any host call (an
+  // unpicked wave never reaches a terminal), then the shared `dispatchAgent`.
+  orca.panels.handle('execute-wave', async (input): Promise<StartResult> => {
+    const result = await executeWave(host, Number(input?.wave ?? 0))
+    if (result.status === 'failed') orca.log(`execute-wave: ${result.detail}`)
     return result
   })
 }

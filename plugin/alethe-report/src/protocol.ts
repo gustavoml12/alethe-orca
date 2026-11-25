@@ -1,5 +1,5 @@
 // The panel <-> worker contract, declared once: src/panel.tsx and src/worker.ts both read it.
-import type { IssueList, OpenResult, ReportList, SetupResult, StartResult } from './reports'
+import type { AssessResult, IssueList, OpenResult, ReportList, SetupResult, StartResult, WaveList } from './reports'
 
 export {}
 
@@ -17,5 +17,13 @@ declare module 'orca' {
     'list-issues': { output: IssueList }
     /** Dispatches the alethe agent for one issue row: kickoff with dry-run + approval hold (terminal never closed). */
     'start-issue': { input: { number: number; title: string; url: string }; output: StartResult }
+    /** Zero-token environment check (alethe, doctor, forge auth) as items — never an exception. */
+    assess: { output: AssessResult }
+    /** Dispatches the alethe leader ONCE to save the wave proposal (nothing is executed). */
+    'propose-waves': { output: StartResult }
+    /** Reads the newest saved proposal's waves (one ephemeral terminal) — empty list, or why not. */
+    'list-waves': { output: WaveList }
+    /** Dispatches the alethe agent for one APPROVED wave (invalid input fails before any host call). */
+    'execute-wave': { input: { wave: number }; output: StartResult }
   }
 }

@@ -4,26 +4,39 @@ import { assert, describe, mockHost, mountWorker, test } from 'orca/testing'
 import { spawnSync } from 'node:child_process'
 import * as main from './worker'
 import {
+  assess,
   checkCommand,
+  doctorCommand,
+  executeWave,
   findCommand,
   folderCommand,
+  gitlabAuthCommand,
+  githubAuthCommand,
   installCommand,
   isReportPath,
   issuesCommand,
   judgeTabCreate,
   listIssues,
   listReports,
+  listWaves,
+  normalizeWave,
+  parseDoctorOutput,
   parseFindOutput,
   parseInstallOutput,
   parseIssuesOutput,
   parseSetupCheck,
   parseSetupFolder,
   parseSetupWrite,
+  parseWavesOutput,
+  PROPOSE_KICKOFF,
+  proposeWaves,
   setupReport,
   shellQuote,
   startIssue,
   startTask,
+  wavesCommand,
   writeCommand,
+  executeWaveKickoff,
   type Host
 } from './reports'
 
@@ -359,7 +372,7 @@ describe('setupReport over an injected host', () => {
     assert.equal(res.status, 'generated')
     assert.equal(res.installed, true, 'esta chamada instalou o alethe')
     assert.equal(res.path, `${FOLDER}/report.html`)
-    assert.equal(res.detail, 'Relatório gerado ✓')
+    assert.equal(res.detail, 'Relatório gerado')
     assert.equal(created.length, 4, 'check, install, folder, write')
     assert.deepEqual(closed, ['t1', 't2', 't3', 't4'], 'cada terminal criado é fechado no finally')
     assert.ok(created[3].includes(shellQuote(FOLDER)), 'a pasta vai entre aspas simples no comando')
@@ -400,7 +413,7 @@ describe('setupReport over an injected host', () => {
     const res = await setupReport(host)
     assert.equal(res.status, 'no-runs')
     assert.equal(res.installed, true)
-    assert.match(res.detail, /Alethe instalado ✓/)
+    assert.match(res.detail, /Alethe instalado/)
     assert.match(res.detail, /\/alethe/)
   })
 
@@ -686,7 +699,7 @@ describe('startTask sobre host injetado', () => {
     const { host, created, closed } = startHost('INSTALLED')
     const res = await startTask(host, 'escrever o plano de testes')
     assert.equal(res.status, 'started')
-    assert.match(res.detail, /Agente iniciado ✓/)
+    assert.match(res.detail, /Agente iniciado/)
     const agent = created.find((record) => record.command.includes('opencode run'))
     assert.ok(agent, 'terminal do agente criado')
     assert.ok(agent.command.includes('escrever o plano de testes'), 'a tarefa vai no comando')
@@ -1093,7 +1106,7 @@ describe('listIssues sobre host injetado', () => {
   })
 })
 
-// --- start-issue: o 🚀 de uma linha da seção de issues dispara a mesma orquestração. ---
+// --- start-issue: o botão de uma linha da seção de issues dispara a mesma orquestração. ---
 
 /** O kickoff exato da spec: issue + runbook + dry-run + AGUARDE minha aprovação. */
 function issueKickoffOf(issue: { number: number; title: string; url: string }): string {
@@ -1211,6 +1224,568 @@ describe('start-issue handler', () => {
     assert.equal(res.status, 'failed')
     assert.match(res.detail, /workspace/)
     assert.ok(tw.logs.some((line) => line.includes('start-issue')), 'falha também vai para o log')
+    await tw.deactivate()
+  })
+})
+
+// --- assess: a avaliação interna do ambiente — zero tokens, itens como dados. ---
+//
+// Três passos em terminais efêmeros (cada um fechado no finally do runStep): o
+// ensureAlethe compartilhado, o `doctor` do orchestrate.py (JSON compacto — a MESMA lição do
+// pretty-PTY das issues: `tr -d '\n'`) e o auth de cada forge. O resultado geral é
+// alethe + python + ≥1 CLI; forge sem auth é item fail, nunca derruba o `ok`.
+
+/** O payload que o `doctor` real devolve (fonte: orchestrate.py `doctor_payload`). */
+const DOCTOR_JSON = JSON.stringify({
+  python: { version: '3.12.4', ok: true },
+  providers: [
+    { provider: 'claude', installed: true, loggedIn: true },
+    { provider: 'codex', installed: true, loggedIn: false },
+    { provider: 'kimi', installed: false, loggedIn: null }
+  ],
+  installedProviders: ['claude', 'codex'],
+  hints: []
+})
+
+/** Roteia os comandos do assess ao passo que cada um representa. */
+function assessFlow(step: {
+  check: string
+  install?: string
+  doctor: string
+  gh: string
+  glab: string
+}): (command: string) => string {
+  return (command) => {
+    if (command.includes('orchestrate.py doctor')) return step.doctor
+    if (command.includes('gh auth status')) return step.gh
+    if (command.includes('glab auth status')) return step.glab
+    if (command.includes('git clone')) return step.install ?? 'INSTALL_FAILED'
+    return step.check
+  }
+}
+
+describe('comandos do assess', () => {
+  test('doctorCommand: JSON compacto, marcador quebrado com "" e NENHUMA chave na fonte', () => {
+    const source = doctorCommand()
+    assert.ok(source.includes('orchestrate.py doctor'), 'roda o doctor do skill')
+    assert.ok(source.includes("tr -d '\\n'"), 'payload em UMA linha (lição do pretty-PTY)')
+    assert.ok(source.includes('DOCTOR""_DONE'), 'marcador quebrado com aspas vazias')
+    assert.ok(!source.includes('DOCTOR_DONE'), 'a fonte nunca carrega o marcador completo')
+    assert.ok(!source.includes('{') && !source.includes('}'), 'sem chaves: o parse {…} não engole o eco')
+  })
+
+  test('auth das forges: marcadores quebrados com "" (nunca "_" literal)', () => {
+    const gh = githubAuthCommand()
+    const glab = gitlabAuthCommand()
+    assert.ok(gh.includes('gh auth status'))
+    assert.ok(gh.includes('GH""_OK') && gh.includes('GH""_FAIL'))
+    assert.ok(!gh.includes('GH_OK') && !gh.includes('GH_FAIL'), 'sem marcador completo na fonte')
+    assert.ok(glab.includes('glab auth status'))
+    assert.ok(glab.includes('GLAB""_OK') && glab.includes('GLAB""_FAIL'))
+    assert.ok(!glab.includes('GLAB_OK') && !glab.includes('GLAB_FAIL'), 'sem marcador completo na fonte')
+  })
+
+  test('os comandos de auth rodam em shell real e imprimem um marcador reconhecível', () => {
+    assert.match(sh(githubAuthCommand()), /GH_(OK|FAIL)\s*$/)
+    assert.match(sh(gitlabAuthCommand()), /GLAB_(OK|FAIL)\s*$/)
+  })
+})
+
+describe('parseDoctorOutput', () => {
+  test('payload real → python, CLIs e auth/quota derivados dos campos', () => {
+    const info = parseDoctorOutput(`${DOCTOR_JSON}\nDOCTOR_DONE`)
+    assert.ok(info, 'payload legível')
+    assert.equal(info?.pythonOk, true)
+    assert.equal(info?.pythonDetail, 'python 3.12.4')
+    assert.deepEqual(info?.clis, ['claude', 'codex'])
+    assert.deepEqual(info?.blocked, ['codex'], 'loggedIn false é problema de auth')
+  })
+
+  test('o eco do comando (sem chaves) não engole o parse', () => {
+    const info = parseDoctorOutput(`${doctorCommand()}\n${DOCTOR_JSON}\nDOCTOR_DONE`)
+    assert.ok(info, 'o eco não tem chaves, o payload continua íntegro')
+  })
+
+  test('python com ok:false → pythonOk false', () => {
+    const info = parseDoctorOutput(JSON.stringify({ python: { version: '3.8.0', ok: false }, installedProviders: ['claude'], providers: [] }))
+    assert.equal(info?.pythonOk, false)
+  })
+
+  test('campos faltando → sem CLIs, sem bloqueios, python não encontrado', () => {
+    const info = parseDoctorOutput('{}')
+    assert.ok(info)
+    assert.deepEqual(info?.clis, [])
+    assert.deepEqual(info?.blocked, [])
+    assert.equal(info?.pythonOk, false)
+  })
+
+  test('sem chaves, JSON inválido ou payload não-objeto → null (nunca exceção)', () => {
+    assert.equal(parseDoctorOutput('python3: command not found\nDOCTOR_DONE'), null)
+    assert.equal(parseDoctorOutput('{broken\nDOCTOR_DONE'), null)
+    assert.equal(parseDoctorOutput('[1,2]\nDOCTOR_DONE'), null)
+    assert.equal(parseDoctorOutput(''), null)
+  })
+})
+
+describe('assess sobre host injetado', () => {
+  test('ambiente pronto → ok:true, seis itens na ordem e todos os terminais fechados', async () => {
+    const { host, created, closed } = scriptedHost(
+      assessFlow({
+        check: 'INSTALLED',
+        doctor: `${DOCTOR_JSON}\nDOCTOR_DONE`,
+        gh: 'GH_OK',
+        glab: 'GLAB_FAIL'
+      })
+    )
+    const res = await assess(host)
+    assert.equal(res.ok, true, 'alethe + python + ≥1 CLI')
+    assert.deepEqual(
+      res.items.map((item) => item.label),
+      ['alethe', 'python', 'CLIs', 'auth/quota', 'github', 'gitlab']
+    )
+    assert.equal(res.items[0]?.state, 'ok')
+    assert.equal(res.items[0]?.detail, 'skill + runner prontos')
+    assert.equal(res.items[1]?.state, 'ok')
+    assert.equal(res.items[1]?.detail, 'python 3.12.4')
+    assert.equal(res.items[2]?.state, 'ok')
+    assert.equal(res.items[2]?.detail, 'claude, codex')
+    assert.equal(res.items[3]?.state, 'warn')
+    assert.match(res.items[3]?.detail ?? '', /codex/)
+    assert.equal(res.items[4]?.state, 'ok', 'gh ok sustenta o ambiente')
+    assert.equal(res.items[5]?.state, 'fail', 'glab sem auth é só o item')
+    assert.equal(created.length, 4, 'check + doctor + gh + glab')
+    assert.deepEqual(closed, ['t1', 't2', 't3', 't4'], 'todo terminal efêmero é fechado')
+  })
+
+  test('alethe sem instalar e clone recusado → ok:false com só o item de falha', async () => {
+    const { host, created } = scriptedHost(
+      assessFlow({
+        check: 'MISSING',
+        install: 'INSTALL_FAILED',
+        doctor: 'NUNCA',
+        gh: 'GH_OK',
+        glab: 'GLAB_OK'
+      })
+    )
+    const res = await assess(host)
+    assert.equal(res.ok, false)
+    assert.equal(res.items.length, 1)
+    assert.equal(res.items[0]?.label, 'alethe')
+    assert.equal(res.items[0]?.state, 'fail')
+    assert.match(res.items[0]?.detail ?? '', /gh auth login/)
+    assert.deepEqual(
+      created.filter((command) => command.includes('doctor')),
+      [],
+      'sem doctor quando o skill não está pronto'
+    )
+  })
+
+  test('doctor sem resposta → ok:false com o item de falha no lugar dos itens do doctor', async () => {
+    const { host, created } = scriptedHost(
+      assessFlow({
+        check: 'INSTALLED',
+        doctor: 'python3: command not found\nDOCTOR_DONE',
+        gh: 'GH_OK',
+        glab: 'GLAB_OK'
+      })
+    )
+    const res = await assess(host)
+    assert.equal(res.ok, false)
+    const labels = res.items.map((item) => item.label)
+    assert.deepEqual(labels, ['alethe', 'doctor', 'github', 'gitlab'], 'um só item de falha')
+    assert.equal(res.items[1]?.state, 'fail')
+    assert.equal(res.items[1]?.detail, 'doctor não respondeu')
+    assert.equal(created.filter((command) => command.includes('gh auth')).length, 1, 'forges seguem avaliadas')
+  })
+
+  test('host rejeita → dados, nunca exceção', async () => {
+    const host: Host = {
+      call: async () => {
+        throw new Error('boom')
+      }
+    }
+    const res = await assess(host)
+    assert.equal(res.ok, false)
+    assert.equal(res.items.length, 1)
+    assert.equal(res.items[0]?.label, 'alethe')
+    assert.match(res.items[0]?.detail ?? '', /boom/)
+  })
+})
+
+// --- propose-waves: o leader do alethe monta a proposta (UM dispatch, só mockado aqui). ---
+
+describe('proposeWaves sobre host injetado', () => {
+  test('abre UM terminal de agente com o kickoff da spec e nunca o fecha', async () => {
+    const { host, created, closed } = startHost('INSTALLED')
+    const res = await proposeWaves(host)
+    assert.equal(res.status, 'started')
+    const agents = created.filter((record) => record.command.includes('opencode run'))
+    assert.equal(agents.length, 1, 'um só dispatch')
+    const agent = agents[0]
+    assert.ok(agent)
+    assert.equal(agent.command, `opencode run ${shellQuote(PROPOSE_KICKOFF)}`, 'kickoff inteiro no shellQuote')
+    assert.ok(agent.command.includes('AVALIAR este projeto'), 'avaliar primeiro')
+    assert.ok(agent.command.includes('proposals/'), 'salva em ~/.config/alethe/proposals/')
+    assert.ok(agent.command.includes('NÃO execute nenhuma wave'), 'nada é executado agora')
+    assert.ok(agent.command.includes('proposta salva'), 'frase final do agent')
+    assert.equal(agent.title, 'alethe: propor waves')
+    assert.deepEqual(
+      closed.filter((terminalId) => terminalId === agent.terminalId),
+      [],
+      'o terminal do agente NUNCA é fechado'
+    )
+    assert.equal(closed.length, 1, 'só o terminal efêmero do check é fechado')
+  })
+
+  test('instalação recusada → failed como dado, sem terminal do agente', async () => {
+    const created: Array<{ terminalId: string; command: string; title: string }> = []
+    let seq = 0
+    const host: Host = {
+      call: async (method, params) => {
+        if (method === 'workspace.readContext') return { workspaceId: 'w1' }
+        if (method === 'terminal.create') {
+          seq += 1
+          const record = {
+            terminalId: `t${seq}`,
+            command: String((params as { command?: string }).command ?? ''),
+            title: String((params as { title?: string }).title ?? '')
+          }
+          created.push(record)
+          return { terminalId: record.terminalId }
+        }
+        if (method === 'terminal.read') {
+          // check → MISSING, install → INSTALL_FAILED: o clone é recusado na hora, sem esperar
+          // o prazo de 120s do install.
+          const command = created[created.length - 1]?.command ?? ''
+          return { lines: [command.includes('git clone') ? 'INSTALL_FAILED' : 'MISSING'], truncated: false }
+        }
+        if (method === 'terminal.close') return { closed: true }
+        return {}
+      }
+    }
+    const res = await proposeWaves(host)
+    assert.equal(res.status, 'failed')
+    assert.ok(created.every((record) => !record.command.includes('opencode run')), 'sem agente')
+  })
+})
+
+// --- list-waves + execute-wave: a proposta salva vira waves executáveis pelo painel. ---
+
+const WAVES_JSON = JSON.stringify({
+  waves: [
+    { id: 1, title: 'Corrigir o dual-forge', issues: [58, 57], playbook: 'bugfix', estimate: '2h' },
+    { id: 2, title: 'Fechar o plano', issues: [42] }
+  ]
+})
+
+describe('wavesCommand', () => {
+  test('fonte sem chaves e sem marcador completo (o eco nunca casa)', () => {
+    const source = wavesCommand()
+    assert.ok(source.includes('NO""_PROPOSAL'), 'marcador quebrado com aspas vazias')
+    assert.ok(source.includes('WAVES""_DONE'), 'marcador de fluxo quebrado com aspas vazias')
+    assert.ok(!source.includes('NO_PROPOSAL') && !source.includes('WAVES_DONE'), 'sem marcador completo')
+    assert.ok(!source.includes('{') && !source.includes('}'), 'payload é objeto: a fonte não tem chaves')
+    assert.ok(source.includes("tr -d '\\n'"), 'payload em UMA linha (lição do pretty-PTY)')
+  })
+
+  test('colapsar "" revela exatamente os marcadores esperados', () => {
+    assert.ok(collapsed(wavesCommand()).includes('echo NO_PROPOSAL'))
+    assert.ok(collapsed(wavesCommand()).includes('echo WAVES_DONE'))
+  })
+})
+
+describe('normalizeWave', () => {
+  test('forma válida passa adiante, com playbook/estimate opcionais', () => {
+    const wave = normalizeWave({ id: 1, title: 'T', issues: [58, 57], playbook: 'p', estimate: '2h' })
+    assert.deepEqual(wave, { id: 1, title: 'T', issues: [58, 57], playbook: 'p', estimate: '2h' })
+    assert.deepEqual(normalizeWave({ id: 2, title: 'T', issues: [42] }), { id: 2, title: 'T', issues: [42] })
+  })
+
+  test('id em string e issues em string viram número', () => {
+    assert.deepEqual(normalizeWave({ id: '3', title: 'T', issues: ['58', 7] }), { id: 3, title: 'T', issues: [58, 7] })
+  })
+
+  test('itens malformados são descartados, nunca lançam', () => {
+    assert.equal(normalizeWave(null), undefined)
+    assert.equal(normalizeWave('wave'), undefined)
+    assert.equal(normalizeWave({ id: 'x', title: 'T', issues: [] }), undefined, 'id sem número')
+    assert.equal(normalizeWave({ id: 1, title: '', issues: [] }), undefined, 'sem título')
+    assert.equal(normalizeWave({ id: 1, title: 'T' }), undefined, 'issues não é array')
+    assert.deepEqual(normalizeWave({ id: 1, title: 'T', issues: ['a', null, '58'] }), { id: 1, title: 'T', issues: [58] }, 'entradas inválidas caem fora')
+  })
+})
+
+describe('parseWavesOutput', () => {
+  test('NO_PROPOSAL → lista vazia sem erro', () => {
+    const parsed = parseWavesOutput('echo NO""_PROPOSAL\nNO_PROPOSAL\nWAVES_DONE')
+    assert.deepEqual(parsed.waves, [])
+    assert.equal(parsed.error, undefined)
+  })
+
+  test('objeto completo → waves normalizadas', () => {
+    const parsed = parseWavesOutput(`${WAVES_JSON}\nWAVES_DONE`)
+    assert.equal(parsed.error, undefined)
+    assert.equal(parsed.waves.length, 2)
+    assert.deepEqual(parsed.waves[0], {
+      id: 1,
+      title: 'Corrigir o dual-forge',
+      issues: [58, 57],
+      playbook: 'bugfix',
+      estimate: '2h'
+    })
+    assert.deepEqual(parsed.waves[1], { id: 2, title: 'Fechar o plano', issues: [42] })
+  })
+
+  test('o eco do comando (sem chaves) não engole o parse', () => {
+    const parsed = parseWavesOutput(`${wavesCommand()}\n${WAVES_JSON}\nWAVES_DONE`)
+    assert.equal(parsed.error, undefined, `erro inesperado: ${parsed.error}`)
+    assert.equal(parsed.waves.length, 2)
+  })
+
+  test('waves válido mas vazio → lista vazia sem erro', () => {
+    const parsed = parseWavesOutput('{"waves":[]}\nWAVES_DONE')
+    assert.deepEqual(parsed.waves, [])
+    assert.equal(parsed.error, undefined)
+  })
+
+  test('JSON inválido, sem objeto ou waves que não é array → erro como dado', () => {
+    for (const bad of ['{"waves":[1,\nWAVES_DONE', 'lixo\nWAVES_DONE', '{"waves":"x"}\nWAVES_DONE', '[1,2]\nWAVES_DONE']) {
+      const parsed = parseWavesOutput(bad)
+      assert.deepEqual(parsed.waves, [], `entrada: ${JSON.stringify(bad)}`)
+      assert.match(parsed.error ?? '', /não consegui ler a proposta de waves/)
+    }
+  })
+
+  test('itens malformados caem fora sem derrubar os válidos', () => {
+    const parsed = parseWavesOutput(
+      '{"waves":[{"id":"x","title":"ruim","issues":[]},{"id":1,"title":"boa","issues":[9]},{"title":"sem id","issues":[1]}]}\nWAVES_DONE'
+    )
+    assert.equal(parsed.error, undefined)
+    assert.deepEqual(parsed.waves, [{ id: 1, title: 'boa', issues: [9] }])
+  })
+})
+
+describe('listWaves sobre host injetado', () => {
+  test('um terminal efêmero, fechado no finally, com o JSON parseado', async () => {
+    const { host, created, closed } = scriptedHost((command) =>
+      command.includes('proposals') ? `${WAVES_JSON}\nWAVES_DONE` : ''
+    )
+    const res = await listWaves(host)
+    assert.equal(res.error, undefined)
+    assert.equal(res.waves.length, 2)
+    assert.equal(created.length, 1, 'um só terminal efêmero')
+    assert.deepEqual(closed, ['t1'], 'fechado no finally')
+  })
+
+  test('sem proposta → lista vazia sem erro, terminal fechado', async () => {
+    const { host, closed } = scriptedHost(() => 'NO_PROPOSAL\nWAVES_DONE')
+    const res = await listWaves(host)
+    assert.deepEqual(res.waves, [])
+    assert.equal(res.error, undefined)
+    assert.deepEqual(closed, ['t1'])
+  })
+
+  test('host rejeita → erro como dado, nunca exceção', async () => {
+    const host: Host = {
+      call: async () => {
+        throw new Error('boom')
+      }
+    }
+    const res = await listWaves(host)
+    assert.deepEqual(res.waves, [])
+    assert.match(res.error ?? '', /boom/)
+  })
+})
+
+describe('executeWave sobre host injetado', () => {
+  test('wave inválida → failed "Escolha uma wave primeiro." antes de qualquer host call', async () => {
+    const { host, created } = startHost('INSTALLED')
+    for (const wave of [0, -1, NaN, Infinity]) {
+      const res = await executeWave(host, wave)
+      assert.equal(res.status, 'failed')
+      assert.equal(res.detail, 'Escolha uma wave primeiro.')
+    }
+    assert.deepEqual(created, [], 'nenhum terminal criado na validação')
+  })
+
+  test('wave válida → abre o agente com o kickoff da aprovação e nunca fecha', async () => {
+    const { host, created, closed } = startHost('INSTALLED')
+    const res = await executeWave(host, 3)
+    assert.equal(res.status, 'started')
+    const agent = created.find((record) => record.command.includes('opencode run'))
+    assert.ok(agent, 'terminal do agente criado')
+    assert.equal(agent.command, `opencode run ${shellQuote(executeWaveKickoff(3))}`)
+    assert.ok(agent.command.includes('APROVOU pelo painel a wave 3'), 'a aprovação vai no kickoff')
+    assert.ok(agent.command.includes('proposals/'), 'aponta para a proposta salva')
+    assert.ok(agent.command.includes('nds-runbook.md'), 'o runbook NDS vai no comando')
+    assert.equal(agent.title, 'alethe: wave 3')
+    assert.deepEqual(
+      closed.filter((terminalId) => terminalId === agent.terminalId),
+      [],
+      'o terminal do agente NUNCA é fechado'
+    )
+    assert.equal(closed.length, 1, 'só o terminal efêmero do check é fechado')
+  })
+})
+
+// --- os handlers novos no worker: assess, propose-waves, list-waves, execute-wave. ---
+
+/** Responde os terminais do assess pelo comando que cada um carrega. */
+function seedAssess(tw: { host: { respond: (method: string, result: unknown) => void } }): void {
+  tw.host.respond('workspace.readContext', CONTEXT)
+  let seq = 0
+  const script = assessFlow({
+    check: 'INSTALLED',
+    doctor: `${DOCTOR_JSON}\nDOCTOR_DONE`,
+    gh: 'GH_OK',
+    glab: 'GLAB_FAIL'
+  })
+  tw.host.respond('terminal.create', (params: { command?: string }) => {
+    seq += 1
+    outputsOf(tw).set(`t${seq}`, script(String(params.command ?? '')))
+    return { terminalId: `t${seq}` }
+  })
+  tw.host.respond('terminal.read', (params: { terminalId?: string }) => ({
+    lines: [outputsOf(tw).get(String(params.terminalId ?? '')) ?? ''],
+    truncated: false
+  }))
+  tw.host.respond('terminal.close', { closed: true })
+}
+
+/** Onde o seed acima guarda a saída de cada terminal criado. */
+const TERMINAL_OUTPUTS = new WeakMap<object, Map<string, string>>()
+function outputsOf(tw: object): Map<string, string> {
+  let map = TERMINAL_OUTPUTS.get(tw)
+  if (!map) {
+    map = new Map()
+    TERMINAL_OUTPUTS.set(tw, map)
+  }
+  return map
+}
+
+describe('assess handler', () => {
+  test('avalia o ambiente pela host e fecha cada terminal', async () => {
+    const tw = await mountWorker(main)
+    seedAssess(tw)
+    const res = await tw.request('assess')
+    assert.equal(res.ok, true)
+    assert.equal(res.items.length, 6)
+    assert.equal(res.items[4]?.label, 'github')
+    assert.equal(tw.host.callsOf('terminal.close').length, 4, 'check + doctor + gh + glab')
+    await tw.deactivate()
+  })
+
+  test('falha chega como resposta (logada), nunca como exceção', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', null)
+    const res = await tw.request('assess')
+    assert.equal(res.ok, false)
+    assert.equal(res.items[0]?.state, 'fail')
+    assert.ok(tw.logs.some((line) => line.includes('assess')), 'erro também vai para o log')
+    await tw.deactivate()
+  })
+})
+
+describe('propose-waves handler', () => {
+  test('dispatch completo: check → agente com o kickoff, sem close do agente', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', CONTEXT)
+    tw.host.respond('terminal.create', (params: { command?: string }) => ({
+      terminalId: String(params.command ?? '').includes('opencode run') ? 'agent' : 'check'
+    }))
+    tw.host.respond('terminal.read', { lines: ['INSTALLED'], truncated: false })
+    tw.host.respond('terminal.close', { closed: true })
+    const res = await tw.request('propose-waves')
+    assert.equal(res.status, 'started')
+    const agent = (tw.host.callsOf('terminal.create') as Array<{ command: string; title: string }>).find(
+      (record) => record.command.includes('opencode run')
+    )
+    assert.ok(agent, 'terminal do agente criado')
+    assert.equal(agent?.title, 'alethe: propor waves')
+    assert.ok(agent?.command.includes('NÃO execute nenhuma wave'))
+    const closes = tw.host.callsOf('terminal.close') as Array<{ terminalId: string }>
+    assert.deepEqual(closes.filter((close) => close.terminalId === 'agent'), [], 'agente nunca fechado')
+    assert.equal(closes.length, 1, 'apenas o check efêmero')
+    await tw.deactivate()
+  })
+
+  test('falha chega como resposta (logada), nunca como exceção', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', null)
+    const res = await tw.request('propose-waves')
+    assert.equal(res.status, 'failed')
+    assert.match(res.detail, /workspace/)
+    assert.ok(tw.logs.some((line) => line.includes('propose-waves')), 'erro também vai para o log')
+    await tw.deactivate()
+  })
+})
+
+describe('list-waves handler', () => {
+  test('responde as waves do arquivo mais novo e fecha o terminal', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', CONTEXT)
+    tw.host.respond('terminal.create', { terminalId: 't1' })
+    tw.host.respond('terminal.read', { lines: [`${WAVES_JSON}\nWAVES_DONE`], truncated: false })
+    tw.host.respond('terminal.close', { closed: true })
+    const res = await tw.request('list-waves')
+    assert.equal(res.error, undefined)
+    assert.equal(res.waves.length, 2)
+    assert.equal(tw.host.callsOf('terminal.close').length, 1)
+    await tw.deactivate()
+  })
+
+  test('proposta ilegível chega como error (logada), nunca como exceção', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', CONTEXT)
+    tw.host.respond('terminal.create', { terminalId: 't1' })
+    tw.host.respond('terminal.read', { lines: ['lixo\nWAVES_DONE'], truncated: false })
+    tw.host.respond('terminal.close', { closed: true })
+    const res = await tw.request('list-waves')
+    assert.deepEqual(res.waves, [])
+    assert.match(res.error ?? '', /não consegui ler a proposta de waves/)
+    assert.ok(tw.logs.some((line) => line.includes('list-waves')), 'erro também vai para o log')
+    await tw.deactivate()
+  })
+})
+
+describe('execute-wave handler', () => {
+  test('input inválido → failed sem nenhuma chamada ao host', async () => {
+    const tw = await mountWorker(main)
+    const res = await tw.request('execute-wave', { wave: 0 })
+    assert.equal(res.status, 'failed')
+    assert.equal(res.detail, 'Escolha uma wave primeiro.')
+    assert.deepEqual(tw.host.calls, [], 'nenhuma chamada ao host antes de validar')
+    await tw.deactivate()
+  })
+
+  test('wave aprovada → dispatch do agente, sem close dele', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', CONTEXT)
+    tw.host.respond('terminal.create', (params: { command?: string }) => ({
+      terminalId: String(params.command ?? '').includes('opencode run') ? 'agent' : 'check'
+    }))
+    tw.host.respond('terminal.read', { lines: ['INSTALLED'], truncated: false })
+    tw.host.respond('terminal.close', { closed: true })
+    const res = await tw.request('execute-wave', { wave: 7 })
+    assert.equal(res.status, 'started')
+    const agent = (tw.host.callsOf('terminal.create') as Array<{ command: string; title: string }>).find(
+      (record) => record.command.includes('opencode run')
+    )
+    assert.equal(agent?.title, 'alethe: wave 7')
+    assert.ok(agent?.command.includes('wave 7'))
+    const closes = tw.host.callsOf('terminal.close') as Array<{ terminalId: string }>
+    assert.deepEqual(closes.filter((close) => close.terminalId === 'agent'), [], 'agente nunca fechado')
+    assert.equal(closes.length, 1, 'apenas o check efêmero')
+    await tw.deactivate()
+  })
+
+  test('falha chega como resposta (logada), nunca como exceção', async () => {
+    const tw = await mountWorker(main)
+    tw.host.respond('workspace.readContext', null)
+    const res = await tw.request('execute-wave', { wave: 2 })
+    assert.equal(res.status, 'failed')
+    assert.match(res.detail, /workspace/)
+    assert.ok(tw.logs.some((line) => line.includes('execute-wave')), 'erro também vai para o log')
     await tw.deactivate()
   })
 })
