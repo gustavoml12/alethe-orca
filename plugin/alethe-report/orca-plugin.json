@@ -1,0 +1,27 @@
+{
+  "manifestVersion": 2,
+  "execution": "trusted-worker",
+  "id": "alethe-report",
+  "name": "Alethe Report",
+  "version": "0.1.0",
+  "description": "Lista os relatórios /alethe report html e abre na aba de browser embutida do Orca.",
+  "engines": { "orca": ">=1.4.259" },
+  "pluginApi": 1,
+  "capabilities": [
+    { "kind": "workspace:read" },
+    { "kind": "terminal:send" },
+    { "kind": "terminal:read" }
+  ],
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "reports",
+        "title": "Alethe Reports",
+        "icon": "file-text",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ]
+  }
+}

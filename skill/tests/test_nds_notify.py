@@ -105,6 +105,120 @@ class NotifyTest(unittest.TestCase):
         self.assertIsNone(nds.pending_warning(self.folder))
 
 
+class DualForgeNotifyTest(unittest.TestCase):
+    """Write-back escolhe o CLI certo: gh no GitHub, glab no GitLab, nunca exceção."""
+
+    def setUp(self):
+        self.folder = Path(tempfile.mkdtemp(prefix="nds-forge-"))
+        self.bin = Path(tempfile.mkdtemp(prefix="nds-forge-bin-"))
+
+    def _write_config(self, config):
+        (self.folder / "nds.json").write_text(json.dumps(config))
+
+    def _fake_cli(self, name, exit_code=0):
+        # Um binário fake por CLI, logando argv num arquivo próprio: o teste vê
+        # QUAL CLI foi chamado (não só "algum comando rodou").
+        fake = self.bin / name
+        fake.write_text("#!/bin/sh\n"
+                        'echo "$@" >> "%s/%s.log"\n'
+                        "exit %d\n" % (self.bin, name, exit_code))
+        fake.chmod(0o755)
+        return str(self.bin) + ":/usr/bin:/bin"
+
+    def _called(self, name):
+        log = self.bin / (name + ".log")
+        return log.read_text() if log.is_file() else None
+
+    def _run(self, path_env, **env):
+        patched = {"PATH": path_env, "NDS_FORGE": ""}
+        patched.update(env)
+        with mock.patch.dict("os.environ", patched):
+            return nds.notify(self.folder, "wave-done", REPORT, text="ok")
+
+    def test_config_forge_github_uses_gh_issue_comment(self):
+        self._write_config({"issue": "42", "forge": "github"})
+        env = self._fake_cli("gh")
+        rc = self._run(env)
+        self.assertEqual(rc, 0)
+        gh_calls = self._called("gh")
+        self.assertIsNotNone(gh_calls, "gh foi chamado")
+        self.assertIn("issue comment 42 --body", gh_calls)
+        self.assertIsNone(self._called("glab"), "glab não participa no GitHub")
+
+    def test_env_forge_overrides_config(self):
+        # ordem de resolução: NDS_FORGE > nds.json > gitlab
+        self._write_config({"issue": "42", "forge": "gitlab"})
+        env = self._fake_cli("gh")
+        rc = self._run(env, NDS_FORGE="github")
+        self.assertEqual(rc, 0)
+        self.assertIn("issue comment 42 --body", self._called("gh") or "")
+        self.assertIsNone(self._called("glab"), "env vence o config")
+
+    def test_env_forge_gitlab_overrides_config_github(self):
+        self._write_config({"issue": "42", "forge": "github"})
+        env = self._fake_cli("glab")
+        rc = self._run(env, NDS_FORGE="gitlab")
+        self.assertEqual(rc, 0)
+        self.assertIn("issue note 42", self._called("glab") or "")
+        self.assertIsNone(self._called("gh"))
+
+    def test_default_still_uses_glab(self):
+        # sem forge no config e sem NDS_FORGE: comportamento antigo preservado
+        self._write_config({"issue": "42"})
+        env = self._fake_cli("glab")
+        rc = self._run(env)
+        self.assertEqual(rc, 0)
+        self.assertIn("issue note 42", self._called("glab") or "")
+        self.assertIsNone(self._called("gh"), "sem forge explícito não há gh")
+
+    def test_github_missing_gh_writes_pending(self):
+        # gh ausente (OSError) cai no mesmo fallback do glab: pendente, nunca exceção
+        self._write_config({"issue": "42", "forge": "github"})
+        with mock.patch.dict("os.environ", {"PATH": "/nonexistent-dir", "NDS_FORGE": ""}):
+            rc = nds.notify(self.folder, "gate-waiting", None, text="gate")
+        self.assertEqual(rc, 0)
+        pending = self.folder / "writeback-pending.md"
+        self.assertTrue(pending.is_file())
+        self.assertIn("gate-waiting", pending.read_text())
+
+    def test_github_gh_failure_writes_pending(self):
+        self._write_config({"issue": "42", "forge": "github"})
+        env = self._fake_cli("gh", exit_code=1)
+        rc = self._run(env)
+        self.assertEqual(rc, 0)
+        pending = self.folder / "writeback-pending.md"
+        self.assertTrue(pending.is_file())
+        self.assertIn("wave-done", pending.read_text())
+
+    def test_github_repo_flag_only_when_config_has_repo(self):
+        self._write_config({"issue": "42", "forge": "github", "repo": "grp/proj"})
+        env = self._fake_cli("gh")
+        self._run(env)
+        self.assertIn("--repo grp/proj", self._called("gh") or "")
+
+        # sem repo no config: nenhum --repo viaja
+        (self.folder / "writeback-pending.md").unlink(missing_ok=True)
+        (self.bin / "gh.log").unlink(missing_ok=True)
+        self._write_config({"issue": "42", "forge": "github"})
+        self._run(env)
+        self.assertNotIn("--repo", self._called("gh") or "")
+
+    def test_gitlab_repo_flag_unchanged(self):
+        # o tratamento do --repo no glab não pode mudar com a dual-forge
+        self._write_config({"issue": "42", "forge": "gitlab", "repo": "grp/proj"})
+        env = self._fake_cli("glab")
+        self._run(env)
+        self.assertIn("issue note 42", self._called("glab") or "")
+        self.assertIn("--repo grp/proj", self._called("glab") or "")
+
+    def test_unknown_forge_falls_back_to_gitlab(self):
+        self._write_config({"issue": "42", "forge": "bitbucket"})
+        env = self._fake_cli("glab")
+        self._run(env)
+        self.assertIn("issue note 42", self._called("glab") or "")
+        self.assertIsNone(self._called("gh"))
+
+
 class GateNotifyTest(unittest.TestCase):
     def setUp(self):
         self.folder = Path(tempfile.mkdtemp(prefix="nds-gaten-"))

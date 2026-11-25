@@ -4,7 +4,8 @@ Tudo roda na pasta de orquestração do workspace (mesmo worktree, `--in current
 
 ## Setup da issue (uma vez por tarefa)
     orca reference add <url-da-issue-gitlab> --worktree active
-    echo '{"issue": "<iid>"}' > <folder>/nds.json
+    echo '{"issue": "<iid>", "forge": "github|gitlab"}' > <folder>/nds.json
+    # forge: "gitlab" → glab issue note, "github" → gh issue comment (default: gitlab; env NDS_FORGE vence)
 
 ## Wave 1 — Planner (Opencode, modelo gratuito)
 Brief: requisito inicial + "gere spec em docs/superpowers/specs/YYYY-MM-DD-<feature>-design.md
@@ -44,4 +45,4 @@ Assessment". defaultTimeoutSeconds: 1800.
     python3 skills/alethe/scripts/orchestrate.py nds-event final --in current --text "Ready to merge"
     python3 skills/alethe/scripts/orchestrate.py report --format html --in current  (abre o report)
 
-Se o `glab` faltar/falhar, os comentários acumulam em `writeback-pending.md` dentro da pasta de orquestração (`~/.config/alethe/orchestrations/<stamp>/`), e o runner avisa no fim da wave.
+Se o CLI do forge (`glab`/`gh`) faltar/falhar, os comentários acumulam em `writeback-pending.md` dentro da pasta de orquestração (`~/.config/alethe/orchestrations/<stamp>/`), e o runner avisa no fim da wave.
